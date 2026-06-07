@@ -402,3 +402,31 @@
 2026-06-07 20:23:29.385 | INFO     | oracle_feed — ChainlinkFeed connected
 2026-06-07 20:23:29.548 | WARNING  | oracle_feed — ChainlinkFeed parse error: Expecting value: line 1 column 1 (char 0)
 2026-06-07 20:23:38.949 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:50AM-10:55AM ET | T-81s
+2026-06-07 20:23:49.011 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:50AM-10:55AM ET | T-71s
+2026-06-07 20:23:59.088 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:50AM-10:55AM ET | T-61s
+2026-06-07 20:24:17.762 | INFO     | __main__ — ============================================================
+2026-06-07 20:24:17.762 | INFO     | __main__ —   PAPER MODE — no real orders will be placed
+2026-06-07 20:24:17.762 | INFO     | __main__ — ============================================================
+2026-06-07 20:24:17.763 | INFO     | state — Database initialised at bot_state.db
+2026-06-07 20:24:17.852 | INFO     | market_discovery — MarketDiscovery started
+2026-06-07 20:24:17.853 | INFO     | binance_feed — BinanceFeed started
+2026-06-07 20:24:17.853 | INFO     | oracle_feed — CoinbaseFeed started
+2026-06-07 20:24:17.853 | INFO     | oracle_feed — ChainlinkFeed started (Polymarket RTDS settlement price)
+2026-06-07 20:24:17.853 | INFO     | polymarket_book — PolymarketBook started
+2026-06-07 20:24:17.853 | DEBUG    | __main__ — Window 1780843800 strike MISSED (no price feed) — will not trade
+2026-06-07 20:24:17.853 | INFO     | __main__ — Bot started in PAPER mode. Waiting for window and feeds...
+2026-06-07 20:24:17.854 | INFO     | dashboard_server — ============================================================
+2026-06-07 20:24:17.854 | INFO     | dashboard_server —   OPEN THE DASHBOARD:  http://localhost:8000/
+2026-06-07 20:24:17.854 | INFO     | dashboard_server — ============================================================
+2026-06-07 20:24:17.945 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:50AM-10:55AM ET | T-42s
+2026-06-07 20:24:18.095 | INFO     | polymarket_book — PolymarketBook connected
+2026-06-07 20:24:18.322 | INFO     | binance_feed — BinanceFeed connected
+2026-06-07 20:24:18.393 | INFO     | oracle_feed — ChainlinkFeed connected
+2026-06-07 20:24:18.559 | WARNING  | oracle_feed — ChainlinkFeed parse error: Expecting value: line 1 column 1 (char 0)
+2026-06-07 20:24:18.950 | INFO     | oracle_feed — CoinbaseFeed connected
+2026-06-07 20:24:18.999 | INFO     | polymarket_book — PolymarketBook closed (code=None)
+2026-06-07 20:24:19.000 | WARNING  | polymarket_book — PolymarketBook disconnected. Reconnecting in 2s
+2026-06-07 20:24:19.000 | INFO     | __main__ — New window: Bitcoin Up or Down - June 7, 10:50AM-10:55AM ET | ref=0.00 (MISSED strike) | T-41s
+2026-06-07 20:24:19.142 | DEBUG    | dashboard_server — Dashboard client connected: ::1
+2026-06-07 20:24:21.413 | INFO     | polymarket_book — PolymarketBook connected
+2026-06-07 20:24:21.414 | INFO     | polymarket_book — PolymarketBook subscribed to 594640491462… / 906957628012…
