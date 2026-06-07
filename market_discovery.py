@@ -142,7 +142,7 @@ class MarketDiscovery:
 
     def _fetch_event(self, slug: str) -> Optional[dict]:
         resp = requests.get(
-            f"{config.GAMMA_API}/events", params={"slug": slug}, timeout=10
+            f"{config.GAMMA_API}/events", params={"slug": slug}, timeout=6
         )
         resp.raise_for_status()
         data = resp.json()

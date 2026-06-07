@@ -1,0 +1,32 @@
+# ── Runtime data — must NEVER sync between local and the VPS ──────────────────
+# The trade history / state DB and logs are written live by each running instance.
+# Keeping them out of git means `git pull` on the VPS never touches its own data.
+bot_state.db
+bot_state.db-shm
+bot_state.db-wal
+bot_state.db.bak.*
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs
+bot.log
+*.log
+
+# Secrets — never commit real keys (the .env.example template stays tracked)
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+sy/

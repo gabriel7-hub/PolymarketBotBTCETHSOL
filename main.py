@@ -49,12 +49,12 @@ class BotRunner:
     def __init__(self, paper_mode: bool = True):
         self.paper_mode = paper_mode
         state.init_db()   # must precede RiskGuard, which reads daily P&L
-        stale = state.cancel_stale_open_positions()   # clear orphans so they can't block trades
-        if stale:
-            logger.info(f"Cleared {stale} stale OPEN position(s) from a previous session")
-        healed = state.reconcile_taker_ledger()       # backfill resolved takers in the history ledger
+        healed = state.reconcile_taker_ledger()       # backfill resolved/cancelled takers in history
         if healed:
             logger.info(f"Reconciled {healed} TAKER ledger row(s) with resolved outcomes")
+        pruned = state.prune_old_data(config.TICK_RETENTION_DAYS)  # bound DB growth on VPS
+        if pruned:
+            logger.info(f"Pruned {pruned} old tick/signal row(s) (> {config.TICK_RETENTION_DAYS}d)")
 
         self.discovery = MarketDiscovery()
         self.binance   = BinanceFeed()
@@ -72,12 +72,41 @@ class BotRunner:
         self._ref_lock = threading.Lock()        # guards _refs/_missed (strike thread + main loop)
         self._pending: dict[int, str] = {}       # start_ts -> condition_id awaiting resolution
         self._settles: dict[int, float] = {}     # start_ts -> oracle price snapshotted at close
+        self._awaiting_real: dict[int, str] = {} # fallback-settled; still chasing REAL outcome
+        self._last_real_poll: float = 0.0        # throttle for the background REAL-outcome poll
         self._resolved: set[int] = set()
         self._arbed: set[int] = set()            # windows we already arbed
         self._last_tick_ts: float = time.time()
         self._farm_reward_session: float = 0.0   # est reward accrued this session
         self._last_farm: dict = {}               # last farm quote details for dashboard
         self._stop = threading.Event()
+        self._readopt_open_positions()           # resume (not cancel) in-flight positions
+
+    def _readopt_open_positions(self):
+        """
+        Re-adopt OPEN positions left by a previous run and queue them for resolution,
+        instead of cancelling them. Cancelling on restart killed in-flight takers so they
+        never got a WIN/LOSS and their history row stayed OPEN. We restore the strike +
+        settle from the outcomes table so the fallback can settle them too.
+        """
+        adopted = 0
+        for pos in state.get_open_positions():
+            start_ts = int(pos["opened_at"] // config.MARKET_WINDOW_SECS) * config.MARKET_WINDOW_SECS
+            self._pending[start_ts] = pos["market_id"]
+            o = state.get_outcome(start_ts)
+            if o:
+                if o.get("ref_price"):
+                    self._refs[start_ts] = o["ref_price"]
+                if o.get("settle_price"):
+                    self._settles[start_ts] = o["settle_price"]
+            adopted += 1
+        if adopted:
+            logger.info(f"Re-adopted {adopted} open position(s) for resolution (not cancelled)")
+        # Re-check recent oracle-FALLBACK settlements against the REAL Chainlink outcome and
+        # correct any the cross-venue basis got wrong on borderline windows.
+        for start_ts, mkt in state.get_recent_fallback_windows(limit=20):
+            if start_ts not in self._resolved:
+                self._awaiting_real[start_ts] = mkt
 
     def start(self):
         self.discovery.start()
@@ -243,27 +272,34 @@ class BotRunner:
     # ─── Resolution (real outcome from Polymarket) ──────────────────────────────
 
     def _retry_pending_resolutions(self):
+        # ── Pass 1: settle POSITIONS quickly at close so they don't carry into the next
+        #            window. Prefer the real outcome if it's already available; otherwise
+        #            (paper) settle on our oracle after a short grace and keep chasing REAL.
         for start_ts, condition_id in list(self._pending.items()):
             closed_at = start_ts + config.MARKET_WINDOW_SECS
-            # Don't poll until the window has actually closed (positions can be queued
-            # for resolution the moment they're opened, mid-window).
             if time.time() < closed_at:
                 continue
             winning = self.discovery.fetch_resolution(start_ts)
             ref = self._get_ref(start_ts)
             settle = self._settles.get(start_ts) or self.oracle.price
             predicted = "UP" if (ref and settle >= ref) else "DOWN"
-            fallback = False
+            source = "REAL"
 
             if winning is None:
-                # The real Polymarket outcome isn't available yet. For BTC 5-min markets
-                # it often never appears via the slug endpoint, which would leave the
-                # position OPEN forever. After a grace period, settle a PAPER position on
-                # our own oracle price so it resolves and lands in Trade History.
                 grace_done = time.time() - closed_at >= config.RESOLUTION_FALLBACK_SECS
                 if self.paper_mode and ref and grace_done:
-                    winning = predicted
-                    fallback = True
+                    winning, source = predicted, "FALLBACK"
+                    self._awaiting_real[start_ts] = condition_id   # upgrade to REAL later
+                elif time.time() - closed_at >= config.RESOLUTION_GIVEUP_SECS:
+                    pos = state.get_open_position()
+                    if pos and pos["market_id"] == condition_id:
+                        state.cancel_position(pos["id"])
+                        state.resolve_taker_ledger(condition_id, "VOID", 0.0)
+                        logger.warning(f"Window {start_ts} unresolvable — position VOIDed")
+                    self._pending.pop(start_ts, None)
+                    self._settles.pop(start_ts, None)
+                    self._resolved.add(start_ts)
+                    continue
                 else:
                     state.upsert_outcome({
                         "start_ts": start_ts, "market_id": condition_id,
@@ -277,18 +313,61 @@ class BotRunner:
                 "start_ts": start_ts, "market_id": condition_id,
                 "ref_price": ref, "settle_price": settle,
                 "winning_side": winning, "predicted_side": predicted,
-                "resolved_at": time.time(),
-                "resolution_source": "FALLBACK" if fallback else "REAL",
+                "resolved_at": time.time(), "resolution_source": source,
             })
             self._resolve_position(condition_id, winning)
-            if fallback:
-                logger.info(
-                    f"Window {start_ts} settled by PAPER FALLBACK (oracle): {winning} "
-                    f"(ref={ref:.2f} settle={settle:.2f}) — real outcome unavailable"
-                )
+            if source == "FALLBACK":
+                logger.info(f"Window {start_ts} settled (paper, oracle): {winning} "
+                            f"— chasing real outcome in background")
             self._pending.pop(start_ts, None)
             self._settles.pop(start_ts, None)
             self._resolved.add(start_ts)
+
+        # ── Pass 2: the REAL Polymarket outcome lands ~minutes after close. Poll for it
+        #            (throttled) and upgrade the calibration record — without touching the
+        #            already-settled position. Keeps backtest data on REAL outcomes.
+        if self._awaiting_real and time.time() - self._last_real_poll >= config.RESOLUTION_REAL_POLL_SECS:
+            self._last_real_poll = time.time()
+            fetched = 0
+            for start_ts, condition_id in list(self._awaiting_real.items()):
+                if time.time() - (start_ts + config.MARKET_WINDOW_SECS) > config.RESOLUTION_GIVEUP_SECS:
+                    self._awaiting_real.pop(start_ts, None)
+                    continue
+                if fetched >= config.RESOLUTION_MAX_FETCH_PER_CYCLE:
+                    break   # bound main-loop stall on slow/flaky VPS network
+                fetched += 1
+                winning = self.discovery.fetch_resolution(start_ts)
+                if winning is None:
+                    continue
+                o = state.get_outcome(start_ts) or {}
+                state.upsert_outcome({
+                    "start_ts": start_ts, "market_id": condition_id,
+                    "ref_price": o.get("ref_price") or self._get_ref(start_ts),
+                    "settle_price": o.get("settle_price"),
+                    "winning_side": winning, "predicted_side": o.get("predicted_side"),
+                    "resolved_at": time.time(), "resolution_source": "REAL",
+                })
+                self._awaiting_real.pop(start_ts, None)
+                # Correct the position if our fast proxy settle disagreed with the REAL
+                # Chainlink outcome (e.g. a borderline window the CEX basis flipped).
+                self._resettle_to_real(condition_id, winning)
+                logger.debug(f"Window {start_ts} REAL outcome captured: {winning} (calibration)")
+
+    def _resettle_to_real(self, condition_id: str, winning: str):
+        import pricing
+        pos = state.get_position_by_market(condition_id)
+        if not pos or pos.get("outcome") not in ("WIN", "LOSS"):
+            return
+        correct = "WIN" if pos["side"] == winning else "LOSS"
+        if correct == pos["outcome"]:
+            return
+        entry = pos["entry_price"]; shares = pos["size_usdc"] / entry
+        fee = pricing.taker_fee_per_share(entry) if pos["order_type"] == "TAKER" else 0.0
+        new_pnl = ((1.0 - entry) if correct == "WIN" else -entry) * shares - fee * shares
+        if state.resettle_position(pos["id"], correct, new_pnl):
+            state.update_taker_ledger(condition_id, correct, new_pnl)
+            logger.info(f"Corrected {condition_id} to REAL outcome {winning}: "
+                        f"{pos['outcome']}→{correct} pnl={new_pnl:+.2f}")
 
     def _resolve_position(self, condition_id: str, winning_side: str):
         """Resolve the open position ONLY if it belongs to the window that resolved."""

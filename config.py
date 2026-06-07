@@ -67,9 +67,17 @@ CANCEL_OPEN_AT       = 30      # cancel any unfilled maker quotes when ≤ this 
 REBATE_FARM_UNTIL    = 60      # only run two-sided rebate quoting above this t_remaining
 REFERENCE_MAX_LAG    = 3       # secs: only trust a strike snapshot taken this close to T=0;
                                # windows caught later have an unreliable strike → never traded
-RESOLUTION_FALLBACK_SECS = 20  # secs after window close to wait for the REAL Polymarket
-                               # outcome before settling a paper position on our own oracle
-                               # price (so positions never hang OPEN if on-chain res lags)
+RESOLUTION_FALLBACK_SECS = 4   # secs after window close to wait for the REAL outcome before
+                               # settling the PAPER position on our own oracle price, so the
+                               # old position doesn't linger into the next window. The real
+                               # Polymarket outcome (which arrives ~minutes later) is still
+                               # captured in the background and upgrades the calibration record.
+RESOLUTION_REAL_POLL_SECS = 15 # how often to poll for the delayed REAL outcome (calibration)
+RESOLUTION_MAX_FETCH_PER_CYCLE = 4  # cap REAL-outcome HTTP calls per poll so a flaky VPS
+                                    # network can't stall the main loop for long
+RESOLUTION_GIVEUP_SECS   = 900 # if a window still can't be resolved this long after close
+                               # (no real outcome AND no strike for fallback), cancel the
+                               # position so it can't block the one-position guard forever
 
 # ─── Probability Model (driftless random-walk barrier — calibrate via backtest.py)
 # P(Up) = Φ( (S_now − ref) / (σ_price · √t_remaining) )
@@ -132,7 +140,14 @@ GAMMA_POLL_INTERVAL  = 10      # seconds between Gamma event fetches (single slu
 # ─── Dashboard / State Push ────────────────────────────────────────────────────
 DASHBOARD_PORT       = int(os.getenv("DASHBOARD_PORT", "8888"))       # WebSocket state feed
 DASHBOARD_HTTP_PORT  = int(os.getenv("DASHBOARD_HTTP_PORT", "8000"))  # serves the UI page
+# Bind host for the dashboard. Default localhost = NOT exposed publicly (use an SSH tunnel:
+# `ssh -L 8000:localhost:8000 user@vps`). Set DASHBOARD_HOST=0.0.0.0 to expose it on the VPS
+# IP — only do that behind a firewall, since it reveals your live trading state to anyone.
+DASHBOARD_HOST       = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 STATE_PUSH_INTERVAL  = 1.0     # seconds between dashboard WebSocket pushes
+
+# ─── Data retention (bound DB growth on a long-running host) ────────────────────
+TICK_RETENTION_DAYS  = int(os.getenv("TICK_RETENTION_DAYS", "14"))   # 0 = keep forever
 
 # ─── SQLite Database ───────────────────────────────────────────────────────────
 DB_PATH              = "bot_state.db"

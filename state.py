@@ -274,7 +274,75 @@ def reconcile_taker_ledger() -> int:
               AND EXISTS (SELECT 1 FROM positions p
                           WHERE p.market_id=trades.market_id AND p.status='RESOLVED')
         """, (time.time(),))
-        return cur.rowcount
+        n = cur.rowcount
+        # Takers whose position was CANCELLED (e.g. by an old restart) → mark CANCELLED,
+        # not left dangling OPEN in the history.
+        conn.execute("""
+            UPDATE trades SET status='CANCELLED', outcome='CANCELLED', closed_at=?
+            WHERE leg='TAKER' AND status='OPEN'
+              AND EXISTS (SELECT 1 FROM positions p
+                          WHERE p.market_id=trades.market_id AND p.status='CANCELLED')
+        """, (time.time(),))
+        return n
+
+
+def get_position_by_market(market_id: str) -> Optional[dict]:
+    """Most recent position for a market (any status) — used to re-settle to the real outcome."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM positions WHERE market_id = ? ORDER BY id DESC LIMIT 1", (market_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_recent_fallback_windows(limit: int = 50) -> list:
+    """(start_ts, market_id) of windows we settled by oracle FALLBACK — candidates to
+    re-check against the real Chainlink outcome and correct if they disagree."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT start_ts, market_id FROM outcomes WHERE resolution_source='FALLBACK' "
+            "ORDER BY start_ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [(r["start_ts"], r["market_id"]) for r in rows]
+
+
+def _resettle_daily(old_pnl: float, old_outcome: str, new_pnl: float, new_outcome: str):
+    """Adjust today's summary by the DELTA when a trade is re-settled (no new trade count)."""
+    import datetime
+    d_win  = (1 if new_outcome == 'WIN' else 0)  - (1 if old_outcome == 'WIN' else 0)
+    d_loss = (1 if new_outcome == 'LOSS' else 0) - (1 if old_outcome == 'LOSS' else 0)
+    d_gp   = max(new_pnl, 0.0) - max(old_pnl, 0.0)
+    d_gl   = max(-new_pnl, 0.0) - max(-old_pnl, 0.0)
+    d_net  = new_pnl - old_pnl
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE daily_summary SET wins=wins+?, losses=losses+?,
+                gross_profit=gross_profit+?, gross_loss=gross_loss+?, net_pnl=net_pnl+?
+            WHERE date=?
+        """, (d_win, d_loss, d_gp, d_gl, d_net, datetime.date.today().isoformat()))
+
+
+def resettle_position(pos_id: int, new_outcome: str, new_pnl: float) -> bool:
+    """Correct an already-resolved position to the real outcome; fixes daily stats by delta."""
+    with _conn() as conn:
+        row = conn.execute("SELECT pnl_usdc, outcome FROM positions WHERE id=?", (pos_id,)).fetchone()
+        if not row or row["outcome"] == new_outcome:
+            return False
+        old_pnl, old_outcome = row["pnl_usdc"] or 0.0, row["outcome"]
+        conn.execute("UPDATE positions SET outcome=?, pnl_usdc=?, exit_price=? WHERE id=?",
+                     (new_outcome, new_pnl, 1.0 if new_outcome == 'WIN' else 0.0, pos_id))
+    _resettle_daily(old_pnl, old_outcome, new_pnl, new_outcome)
+    return True
+
+
+def update_taker_ledger(market_id: str, outcome: str, pnl: float):
+    """Force-update the latest TAKER ledger row for a market (used when re-settling to REAL)."""
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE trades SET status='RESOLVED', outcome=?, pnl_usdc=?, closed_at=?
+            WHERE id = (SELECT id FROM trades WHERE market_id=? AND leg='TAKER'
+                        ORDER BY id DESC LIMIT 1)
+        """, (outcome, pnl, time.time(), market_id))
 
 
 def resolve_taker_ledger(market_id: str, outcome: str, pnl: float):
@@ -382,6 +450,26 @@ def get_open_position() -> Optional[dict]:
             "SELECT * FROM positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_open_positions() -> list:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE status = 'OPEN' ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def prune_old_data(days: int) -> int:
+    """Delete ticks/signals older than `days` so the DB doesn't grow unbounded on a long
+    VPS run (ticks accrue ~1/sec). Keeps positions/outcomes/trades (small, valuable)."""
+    if days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400
+    with _conn() as conn:
+        n = conn.execute("DELETE FROM ticks WHERE ts < ?", (cutoff,)).rowcount
+        n += conn.execute("DELETE FROM signals WHERE ts < ?", (cutoff,)).rowcount
+    return n
 
 
 def cancel_stale_open_positions() -> int:

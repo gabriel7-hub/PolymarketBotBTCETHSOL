@@ -17,35 +17,44 @@ from market_discovery import MarketWindow
 
 
 class OrderBookSide:
-    """Single-side order book (bids or asks). price → size."""
+    """Single-side order book (bids or asks). price → size. Thread-safe: the CLOB WS
+    thread writes while the main loop reads, so all access is under a lock (otherwise
+    max()/min() can raise 'dictionary changed size during iteration')."""
 
     def __init__(self):
         self._levels: dict[float, float] = {}
+        self._lock = threading.Lock()
 
     def apply_snapshot(self, levels: list):
         """Replace book with snapshot: [{price: str, size: str}, ...]"""
-        self._levels = {
+        new = {
             round(float(lvl["price"]), 4): float(lvl["size"])
             for lvl in levels if float(lvl.get("size", 0)) > 0
         }
+        with self._lock:
+            self._levels = new
 
     def apply_delta(self, price: float, size: float):
         price = round(price, 4)
-        if size <= 0:
-            self._levels.pop(price, None)
-        else:
-            self._levels[price] = size
+        with self._lock:
+            if size <= 0:
+                self._levels.pop(price, None)
+            else:
+                self._levels[price] = size
 
     @property
     def best_bid(self) -> Optional[float]:
-        return max(self._levels) if self._levels else None
+        with self._lock:
+            return max(self._levels) if self._levels else None
 
     @property
     def best_ask(self) -> Optional[float]:
-        return min(self._levels) if self._levels else None
+        with self._lock:
+            return min(self._levels) if self._levels else None
 
     def size_at(self, price: float) -> float:
-        return self._levels.get(round(price, 4), 0.0)
+        with self._lock:
+            return self._levels.get(round(price, 4), 0.0)
 
 
 class TokenBook:

@@ -183,7 +183,10 @@ class ChainlinkFeed:
             on_open=self._on_open, on_message=self._on_message,
             on_error=self._on_error, on_close=self._on_close,
         )
-        self._ws.run_forever(ping_interval=20, ping_timeout=10)
+        # Polymarket's RTDS does NOT reply to protocol ping frames, so enforcing a
+        # pong timeout (ping_timeout) kills a healthy connection every ~10s. Send pings
+        # to keep the link alive but DON'T disconnect on a missing pong (ping_timeout=None).
+        self._ws.run_forever(ping_interval=20, ping_timeout=None)
 
     def _on_open(self, ws):
         self.connected = True
@@ -206,6 +209,8 @@ class ChainlinkFeed:
         logger.warning(f"ChainlinkFeed error: {error}")
 
     def _on_message(self, ws, raw: str):
+        if not raw or raw[0] not in "[{":   # ignore empty/keepalive frames quietly
+            return
         try:
             msg = json.loads(raw)
             if msg.get("topic") != "crypto_prices_chainlink":

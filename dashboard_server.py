@@ -73,11 +73,18 @@ class DashboardServer:
         app.router.add_get("/ws", self._ws)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
-        # host=None → bind all interfaces (IPv4 + IPv6) so localhost works either way.
-        site = web.TCPSite(runner, None, config.DASHBOARD_HTTP_PORT)
+        host = config.DASHBOARD_HOST or "127.0.0.1"
+        bind = None if host in ("0.0.0.0", "::") else host   # None = all interfaces
+        site = web.TCPSite(runner, bind, config.DASHBOARD_HTTP_PORT)
         await site.start()
         logger.info("=" * 60)
-        logger.info(f"  OPEN THE DASHBOARD:  http://localhost:{config.DASHBOARD_HTTP_PORT}/")
+        if bind is None:
+            logger.warning(f"  DASHBOARD EXPOSED on 0.0.0.0:{config.DASHBOARD_HTTP_PORT} — "
+                           f"firewall it; anyone can view your trading state")
+        else:
+            logger.info(f"  DASHBOARD (localhost only): http://localhost:{config.DASHBOARD_HTTP_PORT}/")
+            logger.info(f"  Remote: ssh -L {config.DASHBOARD_HTTP_PORT}:localhost:"
+                        f"{config.DASHBOARD_HTTP_PORT} user@your-vps  then open the URL")
         logger.info("=" * 60)
         while True:
             await asyncio.sleep(3600)
