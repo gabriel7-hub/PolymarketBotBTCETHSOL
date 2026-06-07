@@ -430,3 +430,23 @@
 2026-06-07 20:24:19.142 | DEBUG    | dashboard_server — Dashboard client connected: ::1
 2026-06-07 20:24:21.413 | INFO     | polymarket_book — PolymarketBook connected
 2026-06-07 20:24:21.414 | INFO     | polymarket_book — PolymarketBook subscribed to 594640491462… / 906957628012…
+2026-06-07 20:24:28.016 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:50AM-10:55AM ET | T-32s
+2026-06-07 20:24:38.085 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:50AM-10:55AM ET | T-22s
+2026-06-07 20:24:42.140 | DEBUG    | dashboard_server — Dashboard client connected: ::1
+2026-06-07 20:24:47.201 | DEBUG    | dashboard_server — Dashboard client disconnected: ::1
+2026-06-07 20:24:48.144 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:50AM-10:55AM ET | T-12s
+2026-06-07 20:24:58.209 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:50AM-10:55AM ET | T-2s
+2026-06-07 20:25:00.009 | DEBUG    | __main__ — Reference snapshot for 1780844100: 61862.30 (lag 0.0s)
+2026-06-07 20:25:08.279 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:55AM-11:00AM ET | T-292s
+2026-06-07 20:25:08.568 | WARNING  | oracle_feed — ChainlinkFeed error: ping/pong timed out
+2026-06-07 20:25:09.315 | INFO     | polymarket_book — PolymarketBook closed (code=None)
+2026-06-07 20:25:09.315 | WARNING  | polymarket_book — PolymarketBook disconnected. Reconnecting in 2s
+2026-06-07 20:25:09.359 | INFO     | __main__ — New window: Bitcoin Up or Down - June 7, 10:55AM-11:00AM ET | ref=61862.30 | T-291s
+2026-06-07 20:25:11.571 | INFO     | oracle_feed — ChainlinkFeed closed (code=None)
+2026-06-07 20:25:11.573 | WARNING  | oracle_feed — ChainlinkFeed disconnected. Reconnecting in 2s
+2026-06-07 20:25:11.653 | INFO     | polymarket_book — PolymarketBook connected
+2026-06-07 20:25:11.653 | INFO     | polymarket_book — PolymarketBook subscribed to 282100690025… / 304178913792…
+2026-06-07 20:25:14.357 | INFO     | oracle_feed — ChainlinkFeed connected
+2026-06-07 20:25:14.521 | WARNING  | oracle_feed — ChainlinkFeed parse error: Expecting value: line 1 column 1 (char 0)
+2026-06-07 20:25:18.547 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:55AM-11:00AM ET | T-281s
+2026-06-07 20:25:28.614 | DEBUG    | market_discovery — Active: Bitcoin Up or Down - June 7, 10:55AM-11:00AM ET | T-271s
