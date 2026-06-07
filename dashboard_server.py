@@ -1,0 +1,111 @@
+"""
+dashboard_server.py — Single-port HTTP + WebSocket server for the live dashboard.
+
+Serves the dashboard PAGE and the live STATE FEED on the SAME port (default 8000):
+  GET  /        -> dashboard/index.html
+  GET  /ws      -> WebSocket; pushes a JSON state snapshot every second.
+
+Why one port: a browser opening the page at http://host:PORT/ connects the WebSocket to
+ws://host:PORT/ws — the exact same host+port it already reached. That sidesteps every
+cross-port / IPv4-vs-IPv6 / Safari-local-network failure mode that made the old
+two-port (8000 page + 8888 ws) setup hang on "Connecting…".
+"""
+
+import asyncio
+import json
+import math
+import os
+import threading
+from typing import Callable
+from loguru import logger
+import config
+
+try:
+    from aiohttp import web
+    _AIOHTTP_AVAILABLE = True
+except ImportError:
+    _AIOHTTP_AVAILABLE = False
+
+_DASH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
+_INDEX = os.path.join(_DASH_DIR, "index.html")
+
+
+def _sanitize(obj):
+    """
+    Replace non-finite floats (NaN / Infinity) with None. Python's json emits these as
+    bare `NaN`/`Infinity` tokens, which are INVALID JSON — the browser's JSON.parse then
+    throws, the message is silently dropped, and the dashboard reads as 'disconnected'.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
+def _dumps(snapshot: dict) -> str:
+    return json.dumps(_sanitize(snapshot), default=str, allow_nan=False)
+
+
+class DashboardServer:
+
+    def __init__(self, state_fn: Callable[[], dict]):
+        """state_fn: returns the current bot state dict; called every push interval."""
+        self._state_fn = state_fn
+
+    def run(self):
+        """Run the server. Blocks the calling thread — call in a daemon thread."""
+        if not _AIOHTTP_AVAILABLE:
+            logger.error("aiohttp not installed. Run: pip install aiohttp")
+            return
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._serve())
+        except Exception as exc:
+            logger.error(f"Dashboard server crashed: {exc}")
+
+    async def _serve(self):
+        app = web.Application()
+        app.router.add_get("/", self._index)
+        app.router.add_get("/ws", self._ws)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        # host=None → bind all interfaces (IPv4 + IPv6) so localhost works either way.
+        site = web.TCPSite(runner, None, config.DASHBOARD_HTTP_PORT)
+        await site.start()
+        logger.info("=" * 60)
+        logger.info(f"  OPEN THE DASHBOARD:  http://localhost:{config.DASHBOARD_HTTP_PORT}/")
+        logger.info("=" * 60)
+        while True:
+            await asyncio.sleep(3600)
+
+    async def _index(self, request):
+        if not os.path.exists(_INDEX):
+            return web.Response(status=404, text="dashboard/index.html not found")
+        return web.FileResponse(_INDEX)
+
+    async def _ws(self, request):
+        ws = web.WebSocketResponse(heartbeat=20)
+        await ws.prepare(request)
+        peer = request.remote
+        logger.debug(f"Dashboard client connected: {peer}")
+        try:
+            # Send an immediate snapshot, then push on every interval.
+            snap = self._state_fn()
+            if snap:
+                await ws.send_str(_dumps(snap))
+            while not ws.closed:
+                await asyncio.sleep(config.STATE_PUSH_INTERVAL)
+                snap = self._state_fn()
+                if snap:
+                    await ws.send_str(_dumps(snap))
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            logger.debug(f"Dashboard ws error: {exc}")
+        finally:
+            logger.debug(f"Dashboard client disconnected: {peer}")
+        return ws
