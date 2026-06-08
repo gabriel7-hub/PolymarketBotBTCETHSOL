@@ -40,6 +40,13 @@ class MarketWindow:
     slug:            str = ""
     rewards_max_spread: float = 0.0  # price distance from mid that earns rewards (e.g. 0.045)
     rewards_min_size:   float = 0.0  # min order size to qualify for rewards (e.g. 50)
+    rewards_active:  bool = False    # TRUE only if a live liquidity-reward POOL exists.
+                                     # BTC 5-min markets publish rewards_max_spread/min_size
+                                     # as vestigial template fields but carry rewards.rates=null
+                                     # (CLOB) / clobRewards=null (Gamma) → nothing to farm.
+                                     # Verified against the CLOB API 2026-06-08. The farm leg
+                                     # is gated on this so it never quotes for phantom yield.
+    holding_rewards: bool = False    # market-level holdingRewardsEnabled flag (≈never set on 5-min)
     fetched_at:      float = field(default_factory=time.time)
 
     @property
@@ -75,6 +82,7 @@ class MarketDiscovery:
         self._current: Optional[MarketWindow] = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._clob_meta_cache: dict[str, dict] = {}   # condition_id → authoritative reward/fee meta
 
     @property
     def current(self) -> Optional[MarketWindow]:
@@ -155,6 +163,49 @@ class MarketDiscovery:
         markets = ev.get("markets") or []
         return markets[0] if markets else None
 
+    def _clob_meta(self, condition_id: str) -> dict:
+        """
+        Authoritative reward-pool + fee check from the CLOB, cached per condition_id so it
+        costs one cheap GET per 5-min window (not per poll). Returns:
+          {"rewards_active": bool, "checked": bool}
+
+        Also a FEE-SCHEDULE TRIPWIRE (improvement #2): our EV engine hardcodes the dynamic
+        crypto taker fee as config.TAKER_FEE_RATE · p·(1−p) (= 0.07, confirmed against the
+        official fees doc 2026-06-08). The live dynamic-rate descriptor is NOT exposed on the
+        public REST endpoint, so we do not auto-override the coefficient (misreading e.g.
+        taker_base_fee=1000 as a rate would catastrophically mis-gate EV). Instead we WARN if
+        the market grows a top-level flat `fee`, so a future schedule change is caught loudly
+        rather than silently mispricing every trade.
+        """
+        if not condition_id:
+            return {"rewards_active": False, "checked": False}
+        cached = self._clob_meta_cache.get(condition_id)
+        if cached is not None:
+            return cached
+        meta = {"rewards_active": False, "checked": False}
+        try:
+            resp = requests.get(f"{config.CLOB_HOST}/markets/{condition_id}", timeout=6)
+            resp.raise_for_status()
+            m = resp.json()
+            rates = (m.get("rewards") or {}).get("rates")
+            meta["rewards_active"] = bool(rates)
+            meta["checked"] = True
+            flat_fee = m.get("fee")
+            if flat_fee not in (None, 0, "0", "", "0.0"):
+                logger.warning(
+                    f"FEE TRIPWIRE: market {condition_id[:12]} reports a non-null top-level "
+                    f"fee={flat_fee!r}. Our EV model assumes ONLY the dynamic "
+                    f"C·{config.TAKER_FEE_RATE}·p·(1−p) taker fee — verify the live schedule "
+                    f"(getClobMarketInfo / docs.polymarket.com/trading/fees) before trusting EV."
+                )
+        except Exception as exc:
+            logger.debug(f"CLOB meta fetch failed for {condition_id[:12]}: {exc}")
+        # Cap the cache so a long-running host doesn't accumulate one entry per window forever.
+        if len(self._clob_meta_cache) > 500:
+            self._clob_meta_cache.clear()
+        self._clob_meta_cache[condition_id] = meta
+        return meta
+
     def _parse_event(self, ev: dict, start_ts: int) -> Optional[MarketWindow]:
         try:
             title = ev.get("title", "") or ""
@@ -183,8 +234,16 @@ class MarketDiscovery:
             rmin = mkt.get("rewardsMinSize")
             rewards_min_size = float(rmin) if rmin not in (None, "") else 0.0
 
+            # Does a live reward POOL actually exist? Prefer the authoritative CLOB
+            # rewards.rates; fall back to the Gamma clobRewards mirror if that call failed.
+            condition_id = mkt.get("conditionId") or mkt.get("id") or ""
+            meta = self._clob_meta(condition_id)
+            rewards_active = (meta["rewards_active"] if meta.get("checked")
+                              else _rewards_live(mkt.get("clobRewards")))
+            holding_rewards = bool(mkt.get("holdingRewardsEnabled", False))
+
             return MarketWindow(
-                condition_id=mkt.get("conditionId") or mkt.get("id") or "",
+                condition_id=condition_id,
                 market_title=title,
                 up_token_id=str(up_token_id),
                 down_token_id=str(down_token_id),
@@ -195,10 +254,35 @@ class MarketDiscovery:
                 slug=ev.get("slug", ""),
                 rewards_max_spread=rewards_max_spread,
                 rewards_min_size=rewards_min_size,
+                rewards_active=rewards_active,
+                holding_rewards=holding_rewards,
             )
         except Exception as exc:
             logger.warning(f"Failed to parse event {ev.get('slug','?')}: {exc}")
             return None
+
+
+def _rewards_live(clob_rewards) -> bool:
+    """
+    Fallback reward-pool check from the Gamma `clobRewards` field (used only if the
+    authoritative CLOB call failed). True iff it carries a positive reward rate/amount.
+    Null/empty (the observed state for BTC 5-min) → no pool. Defensive about shape since
+    a populated clobRewards schema isn't observable on these markets.
+    """
+    if not clob_rewards:
+        return False
+    items = clob_rewards if isinstance(clob_rewards, list) else [clob_rewards]
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        for key in ("rewardsDailyRate", "rewards_daily_rate", "dailyRate",
+                    "rate", "rewardsAmount", "rewardsAmountPerDay"):
+            try:
+                if float(it.get(key) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
 
 
 def _json_list(value) -> list:

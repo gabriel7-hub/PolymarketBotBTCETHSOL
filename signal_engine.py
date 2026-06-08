@@ -206,12 +206,18 @@ class SignalEngine:
                 return s
 
         # ── 3. REWARD FARM: two-sided, delta-neutral, early window ────────────────
-        if config.FARM_ENABLED and t_rem > config.REBATE_FARM_UNTIL:
+        # Gated on a LIVE reward pool. BTC 5-min markets carry rewards.rates=null (verified
+        # vs CLOB API 2026-06-08) — quoting there earns ~nothing and only invites adverse
+        # selection, so we skip. Farming is an edge on EVENT markets that have a real pool.
+        if (config.FARM_ENABLED and t_rem > config.REBATE_FARM_UNTIL
+                and getattr(window, "rewards_active", False)):
             farm = self._reward_farm(mk, window, mid, up_bid, up_ask, down_bid, down_ask)
             if farm is not None:
                 return farm
 
-        return mk(Action.SKIP, f"no signal: arb={arb_edge:.4f} ev_up={ev_up:.4f} ev_down={ev_down:.4f}")
+        farm_note = "" if getattr(window, "rewards_active", False) else " farm=no-pool"
+        return mk(Action.SKIP, f"no signal: arb={arb_edge:.4f} ev_up={ev_up:.4f} "
+                               f"ev_down={ev_down:.4f}{farm_note}")
 
     # ─── Two-sided liquidity-reward farm leg ───────────────────────────────────
 
