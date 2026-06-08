@@ -52,7 +52,9 @@ MAX_CONSECUTIVE_LOSSES = 0     # halt after this many losses in a row (0 = disab
 # We trade on fee-net expected value per share, NOT a flat cent edge. The taker fee
 # C·0.07·p·(1−p) is largest at 50¢ and tiny near the extremes, so a flat threshold
 # over-trades the coin-flip zone and under-trades confident edges.
-MIN_EV_TAKER         = 0.015   # min fee-net EV per share ($) to fire an IOC taker
+MIN_EV_TAKER         = 0.03    # min fee-net EV per share ($) to fire an IOC taker. Raised from
+                               # 0.015 after out-of-sample validation: 0.03 cleared the coin-flip
+                               # fee-peak zone and gave the best held-out P&L at vol_mult=0.7.
 MIN_EV_MAKER         = 0.005   # min EV per share ($) for a rebate-farm maker quote
 MAX_SPREAD           = 0.06    # skip if order book spread is wider than this
 MAX_SLIPPAGE         = 0.02    # 2¢: cancel if ask moves more than this before fill
@@ -84,8 +86,12 @@ RESOLUTION_GIVEUP_SECS   = 900 # if a window still can't be resolved this long a
 VOL_WINDOW_SECS      = 45      # rolling window of log-returns for realized vol estimate
 MOMENTUM_WINDOW_SECS = 15      # seconds of price history for the 15s momentum diagnostic
 VOL_FLOOR_PER_SEC    = 1.0e-5  # floor on per-second return vol (avoid div-by-zero / overconfidence)
-VOL_MULT             = 1.0     # live σ scaling. Calibrate with `backtest.py --sweep` on REAL
-                               # outcomes and set the Brier-minimising value here.
+VOL_MULT             = 0.7     # live σ scaling. Validated out-of-sample (backtest.py --validate,
+                               # 258 REAL windows, 2026-06-08): vol_mult=1.0 lost on every held-out
+                               # test slice (53% win, −$ net); vol_mult=0.7 was profitable on all
+                               # splits (66–71% win, PF 1.47–2.13). At 1.0 the model's σ was too
+                               # wide → probabilities too timid → fake EV near 50¢ paying peak fee.
+                               # Re-confirm with `backtest.py --validate` as more REAL data accrues.
 DRIFT_WEIGHT         = 0.0     # momentum→drift weight; 0 = pure driftless (theoretically correct)
 BASIS_VOL_INFLATE    = 1.0     # how much CEX disagreement (bp) inflates σ → pulls P toward 0.5
 
