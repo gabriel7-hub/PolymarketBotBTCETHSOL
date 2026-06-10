@@ -507,7 +507,10 @@ class BotRunner:
         daily = state.get_daily_stats()
         overall = state.get_overall_stats()
         trades = daily.get("trades", 0)
-        win_rate = daily.get("wins", 0) / trades if trades > 0 else 0.0
+        # Win rate over decided trades only — BOXED positions exited early and can be
+        # neither WIN nor LOSS, so leaving them in the denominator understates the rate.
+        decided = daily.get("wins", 0) + daily.get("losses", 0)
+        win_rate = daily.get("wins", 0) / decided if decided > 0 else 0.0
 
         self._dash_state = {
             "ts": time.time(),

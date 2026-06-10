@@ -73,8 +73,14 @@ BOX_STOP_ENABLED     = True    # hedge-to-box stop-loss on the open taker positi
 #     bucket wins 65.5% vs 57.3% implied): at 0.10 the first 100 live trades boxed 73%
 #     of positions, clipping winners early (−$44 vs hold); wide margins won on that
 #     sample (0.20→+$22, 0.25→+$38 vs hold).
-# Asymmetry NOT yet validated as a pair — re-check with the box counterfactual query
-# once a fresh VPS db is available. Full losses on instant gaps are irreducible.
+# Pair CROSS-VALIDATED 2026-06-10 on two independent samples: pre-deploy 474 trades
+# (hold $614 → $707) and post-deploy 119 trades (hold $275 → $384, actual sym-0.10
+# realized only $286). 0.10/0.20 was the max-min choice across both; wider profit
+# margins only won on the post sample. Mechanical alternatives (late-window lock,
+# pair-cost trailing lock) all LOST $60-170 vs hold — the late-flip full losses they
+# catch are cheaper than the winners they clip. Full losses on fast gaps are
+# irreducible: the EV trigger can't fire once opp_ask > 0.90 (1−c−margin ≤ 0), and
+# that's correct behavior. Judge this rule by NET, not by the LOSS line.
 BOX_STOP_MARGIN_LOSS   = 0.10
 BOX_STOP_MARGIN_PROFIT = 0.20
 MAX_SPREAD           = 0.06    # skip if order book spread is wider than this
