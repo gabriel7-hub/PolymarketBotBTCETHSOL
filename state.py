@@ -524,6 +524,19 @@ def get_daily_stats(date_str: Optional[str] = None) -> dict:
                 "gross_profit": 0, "gross_loss": 0, "net_pnl": 0, "rebates": 0}
 
 
+def get_overall_stats() -> dict:
+    """Lifetime totals across every recorded day (taker P&L; rebates/rewards separate)."""
+    with _conn() as conn:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(net_pnl), 0)  AS net_pnl,
+                   COALESCE(SUM(rebates), 0)  AS rebates,
+                   COALESCE(SUM(trades), 0)   AS trades,
+                   COALESCE(SUM(wins), 0)     AS wins
+            FROM daily_summary
+        """).fetchone()
+        return dict(row)
+
+
 def get_recent_signals(limit: int = 50) -> list:
     with _conn() as conn:
         rows = conn.execute("""

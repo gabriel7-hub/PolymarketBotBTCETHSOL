@@ -174,6 +174,7 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
     <div class="brand">POLY<b>DESK</b><span class="tag">BTC · 5MIN</span></div>
     <div class="hstat"><span class="k">Mode</span><span id="h-mode" class="pill paper">PAPER</span></div>
     <div class="hstat"><span class="k">Session P&amp;L</span><span id="h-pnl" class="v num muted">—</span></div>
+    <div class="hstat"><span class="k">Overall P&amp;L</span><span id="h-opnl" class="v num muted">—</span></div>
     <div class="hstat"><span class="k">Reward Yield</span><span id="h-rebate" class="v num up">—</span></div>
     <div class="hstat"><span class="k">Trades</span><span id="h-trades" class="v num">0</span></div>
     <div class="hstat"><span class="k">Win Rate</span><span id="h-wr" class="v num muted">—</span></div>
@@ -358,6 +359,7 @@ function render(d){
   const stat=(bot.status||'PAPER'),sl=stat.toLowerCase();
   set('h-mode',stat,'pill '+(sl.includes('halt')?'halted':sl.includes('cool')?'cooldown':sl==='live'?'live':'paper'));
   set('h-pnl',money(bot.daily_pnl),'v num '+pnlc(bot.daily_pnl));
+  set('h-opnl',money(bot.overall_pnl),'v num '+pnlc(bot.overall_pnl));
   set('h-rebate',bot.rebates_today!=null?'+$'+f(bot.rebates_today,3):'—','v num up');
   set('h-trades',String(bot.daily_trades||0),'v num');
   set('h-wr',bot.win_rate!=null?pct(bot.win_rate):'—','v num '+(bot.win_rate>=.5?'up':bot.win_rate!=null?'down':'muted'));

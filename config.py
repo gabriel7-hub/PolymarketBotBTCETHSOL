@@ -65,12 +65,18 @@ MIN_TAKER_ENTRY      = 0.50    # never IOC a side whose ask is below this. VPS d
                                # this floor: +$661 on 464 trades vs +$253 on all 684. Revisit with
                                # `backtest.py --buckets` once a bucket shows real edge.
 BOX_STOP_ENABLED     = True    # hedge-to-box stop-loss on the open taker position
-BOX_STOP_MARGIN      = 0.10    # box (buy the opposite side, locking $1/pair) when
-                               # p_side < 1 − opposite_ask − margin. Validated on 464
-                               # recorded positions (2026-06-10): hold-to-resolution $662 →
-                               # $809 boxed, avg loss −$26 → −$14; margins 0.08–0.15 all
-                               # beat holding (broad plateau). Tighter margins over-trigger
-                               # on model noise (boxed trades that would have won).
+# Box trigger: p_side < 1 − opposite_ask − margin. One margin was doing two opposing
+# jobs, so it is split by what the box would lock (entry + opposite_ask vs $1):
+#   LOSS side  — tight, react while the hedge is still cheap (−$10 beats −$26). Replay
+#     2026-06-10 (464 pre-deploy positions): tight margins won (+$147 vs hold at 0.10).
+#   PROFIT side — wide, because the model is UNDERCONFIDENT on favorites (0.50-0.65
+#     bucket wins 65.5% vs 57.3% implied): at 0.10 the first 100 live trades boxed 73%
+#     of positions, clipping winners early (−$44 vs hold); wide margins won on that
+#     sample (0.20→+$22, 0.25→+$38 vs hold).
+# Asymmetry NOT yet validated as a pair — re-check with the box counterfactual query
+# once a fresh VPS db is available. Full losses on instant gaps are irreducible.
+BOX_STOP_MARGIN_LOSS   = 0.10
+BOX_STOP_MARGIN_PROFIT = 0.20
 MAX_SPREAD           = 0.06    # skip if order book spread is wider than this
 MAX_SLIPPAGE         = 0.02    # 2¢: cancel if ask moves more than this before fill
 

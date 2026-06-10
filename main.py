@@ -419,7 +419,7 @@ class BotRunner:
 
     def _maybe_box_position(self, signal, window):
         """
-        Hedge-to-box stop-loss (see BOX_STOP_MARGIN in config.py). Each tick, if the
+        Hedge-to-box stop-loss (see BOX_STOP_MARGIN_LOSS/_PROFIT in config.py). Each tick, if the
         model probability of our open taker's side has collapsed enough that buying the
         opposite side — locking $1/pair — beats holding by the margin, box it. The
         leaderboard winners' loss-capping mechanic: they never ride a flipped window to
@@ -439,7 +439,12 @@ class BotRunner:
             p_side, opp_ask = signal.p_down, signal.up_ask
         if opp_ask is None or opp_ask >= 1.0:
             return
-        if p_side < 1.0 - opp_ask - config.BOX_STOP_MARGIN:
+        # Asymmetric margin: tight when the box caps a loss (pair costs ≥ $1),
+        # wide when it takes profit — see the rationale in config.py.
+        locking_loss = (pos["entry_price"] + opp_ask) >= 1.0
+        margin = (config.BOX_STOP_MARGIN_LOSS if locking_loss
+                  else config.BOX_STOP_MARGIN_PROFIT)
+        if p_side < 1.0 - opp_ask - margin:
             pnl = self.executor.box_position(window, pos, opp_ask)
             if pnl is not None and pnl < 0:
                 # A boxed loss is still a wrong call — count it for the cooldown.
@@ -500,6 +505,7 @@ class BotRunner:
 
     def _update_dash_state(self, window=None, signal=None):
         daily = state.get_daily_stats()
+        overall = state.get_overall_stats()
         trades = daily.get("trades", 0)
         win_rate = daily.get("wins", 0) / trades if trades > 0 else 0.0
 
@@ -512,6 +518,9 @@ class BotRunner:
                 "daily_trades": trades,
                 "win_rate": round(win_rate, 3),
                 "rebates_today": round(daily.get("rebates", 0.0), 3),
+                "overall_pnl": round(overall.get("net_pnl", 0.0)
+                                     + overall.get("rebates", 0.0), 2),
+                "overall_trades": overall.get("trades", 0),
             },
             "market": {
                 "title": window.market_title if window else None,
