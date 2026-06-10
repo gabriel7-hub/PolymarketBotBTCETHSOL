@@ -37,6 +37,7 @@ class Action:
     POST_FARM       = "POST_FARM"     # two-sided delta-neutral reward farm
     IOC_UP          = "IOC_UP"
     IOC_DOWN        = "IOC_DOWN"
+    LATE_MOMENTUM   = "LATE_MOMENTUM"  # EXPERIMENTAL paper-only late-leader bet (shadow leg)
     SKIP            = "SKIP"
     NO_MARKET       = "NO_MARKET"
     FEEDS_DOWN      = "FEEDS_DOWN"
@@ -169,6 +170,15 @@ class SignalEngine:
         # ── Guards ───────────────────────────────────────────────────────────────
         if not self._oracle.connected or not self._book.connected:
             return mk(Action.FEEDS_DOWN, "price/book feed not connected")
+
+        # ── EXPERIMENTAL late-window momentum (paper SHADOW leg; OFF by default). ──
+        # Sits BEFORE the MIN_SECONDS_TO_TRADE guard because it deliberately fires inside
+        # the last ~25s. When LATE_MOMENTUM_ENABLED is False this is a complete no-op.
+        if config.LATE_MOMENTUM_ENABLED and window.has_reference:
+            lm = self._late_momentum(mk, t_rem, up_ask, down_ask, up_spread, p_up, p_down)
+            if lm is not None:
+                return lm
+
         if t_rem < config.MIN_SECONDS_TO_TRADE:
             return mk(Action.SKIP, f"T-{t_rem:.0f}s < MIN_SECONDS_TO_TRADE")
 
@@ -192,13 +202,15 @@ class SignalEngine:
         spread_ok = up_spread is None or up_spread <= config.MAX_SPREAD
         if (window.has_reference and spread_ok
                 and config.TAKER_ZONE_END <= t_rem <= config.TAKER_ZONE_START):
-            if ev_up >= config.MIN_EV_TAKER and up_ask is not None and up_sane:
+            if (ev_up >= config.MIN_EV_TAKER and up_ask is not None and up_sane
+                    and up_ask >= config.MIN_TAKER_ENTRY):
                 s = mk(Action.IOC_UP,
                        f"TAKER P(Up)={p_up:.3f} ev={ev_up:.4f}≥{config.MIN_EV_TAKER}",
                        mode="TAKER")
                 s.order_side, s.order_price, s.order_type = "UP", up_ask, "TAKER"
                 return s
-            if ev_down >= config.MIN_EV_TAKER and down_ask is not None and down_sane:
+            if (ev_down >= config.MIN_EV_TAKER and down_ask is not None and down_sane
+                    and down_ask >= config.MIN_TAKER_ENTRY):
                 s = mk(Action.IOC_DOWN,
                        f"TAKER P(Down)={p_down:.3f} ev={ev_down:.4f}≥{config.MIN_EV_TAKER}",
                        mode="TAKER")
@@ -218,6 +230,35 @@ class SignalEngine:
         farm_note = "" if getattr(window, "rewards_active", False) else " farm=no-pool"
         return mk(Action.SKIP, f"no signal: arb={arb_edge:.4f} ev_up={ev_up:.4f} "
                                f"ev_down={ev_down:.4f}{farm_note}")
+
+    # ─── Late-window momentum leg (EXPERIMENTAL, paper shadow) ──────────────────
+
+    def _late_momentum(self, mk, t_rem, up_ask, down_ask, up_spread, p_up, p_down):
+        """
+        Bet the LATE LEADER. Inside the late band, if exactly one side's ask is in
+        [THRESHOLD, MAX_ASK] (the two asks sum to ~1, so at most one can lead), emit a
+        paper-only bet on it. The edge (validated only weakly: ~10 OOS bets) is that the
+        late leader is under-priced. Gating is PRICE-based — that is the signal we tested;
+        the model p is recorded in the reason only as a diagnostic, not used as a gate.
+        """
+        if not (config.LATE_MOMENTUM_ZONE_END <= t_rem <= config.LATE_MOMENTUM_ZONE_START):
+            return None
+        if up_spread is not None and up_spread > config.MAX_SPREAD:
+            return None
+        lo, hi = config.LATE_MOMENTUM_THRESHOLD, config.LATE_MOMENTUM_MAX_ASK
+        side = ask = model_p = None
+        if up_ask is not None and lo <= up_ask <= hi:
+            side, ask, model_p = "UP", up_ask, p_up
+        elif down_ask is not None and lo <= down_ask <= hi:
+            side, ask, model_p = "DOWN", down_ask, p_down
+        if side is None:
+            return None
+        s = mk(Action.LATE_MOMENTUM,
+               f"LATE-MOM {side}@{ask:.2f} model_p={model_p:.2f} T-{t_rem:.0f}s "
+               f"(paper shadow · EXPERIMENTAL)",
+               mode="LATE_MOM")
+        s.order_side, s.order_price, s.order_type = side, ask, "TAKER"
+        return s
 
     # ─── Two-sided liquidity-reward farm leg ───────────────────────────────────
 

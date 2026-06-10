@@ -76,6 +76,8 @@ class BotRunner:
         self._last_real_poll: float = 0.0        # throttle for the background REAL-outcome poll
         self._resolved: set[int] = set()
         self._arbed: set[int] = set()            # windows we already arbed
+        self._late_mom: dict[int, dict] = {}     # start_ts -> open late-momentum shadow bet
+        self._late_mom_session: float = 0.0      # paper P&L of the experimental late-momentum leg
         self._last_tick_ts: float = time.time()
         self._farm_reward_session: float = 0.0   # est reward accrued this session
         self._last_farm: dict = {}               # last farm quote details for dashboard
@@ -219,6 +221,26 @@ class BotRunner:
                             # open-position guard forever).
                             if start_ts not in self._resolved:
                                 self._pending[start_ts] = window.condition_id
+                elif signal.action == Action.LATE_MOMENTUM:
+                    # EXPERIMENTAL shadow leg — PAPER ONLY, hard-gated here so it can never
+                    # place a live order. Records one isolated leg='LATE_MOM' ledger row per
+                    # window (no real position, no risk-guard interaction). Resolved later
+                    # from the same outcome in _resolve_late_mom.
+                    if (self.paper_mode and config.LATE_MOMENTUM_ENABLED
+                            and start_ts not in self._late_mom):
+                        tid = state.record_trade({
+                            "market_id": window.condition_id, "start_ts": start_ts,
+                            "leg": "LATE_MOM", "side": signal.order_side,
+                            "price": signal.order_price, "detail": signal.reason,
+                            "size_usdc": config.LATE_MOMENTUM_SIZE_USDC,
+                            "status": "OPEN", "outcome": None,
+                        })
+                        self._late_mom[start_ts] = {
+                            "side": signal.order_side, "price": signal.order_price,
+                            "trade_id": tid,
+                        }
+                        logger.info(f"[PAPER·EXPERIMENTAL] late-momentum "
+                                    f"{signal.order_side}@{signal.order_price:.2f}")
 
                 # Window closing: queue for resolution and snapshot the settle price
                 # (oracle price at close) — used as the paper fallback if the real
@@ -316,6 +338,7 @@ class BotRunner:
                 "resolved_at": time.time(), "resolution_source": source,
             })
             self._resolve_position(condition_id, winning)
+            self._resolve_late_mom(start_ts, winning)
             if source == "FALLBACK":
                 logger.info(f"Window {start_ts} settled (paper, oracle): {winning} "
                             f"— chasing real outcome in background")
@@ -368,6 +391,28 @@ class BotRunner:
             state.update_taker_ledger(condition_id, correct, new_pnl)
             logger.info(f"Corrected {condition_id} to REAL outcome {winning}: "
                         f"{pos['outcome']}→{correct} pnl={new_pnl:+.2f}")
+
+    def _resolve_late_mom(self, start_ts: int, winning_side: str):
+        """Settle the EXPERIMENTAL late-momentum shadow bet for a window (paper-only).
+        Isolated from the real position lifecycle: just scores the ledger row + a session
+        tally so we can compare it against the taker leg. Authoritative measurement is
+        still backtest.py --validate on REAL outcomes."""
+        lm = self._late_mom.pop(start_ts, None)
+        if not lm:
+            return
+        import pricing
+        entry = lm["price"]
+        shares = config.LATE_MOMENTUM_SIZE_USDC / entry
+        won = (lm["side"] == winning_side)
+        fee = pricing.taker_fee_per_share(entry) * shares
+        pnl = ((1.0 - entry) if won else -entry) * shares - fee
+        state.update_trade(lm["trade_id"], status="RESOLVED",
+                           outcome=("WIN" if won else "LOSS"),
+                           pnl_usdc=round(pnl, 4), closed_at=time.time())
+        self._late_mom_session += pnl
+        logger.info(f"[PAPER·EXPERIMENTAL] late-momentum {lm['side']} "
+                    f"{'WIN' if won else 'LOSS'} pnl={pnl:+.2f} "
+                    f"(session {self._late_mom_session:+.2f})")
 
     def _resolve_position(self, condition_id: str, winning_side: str):
         """Resolve the open position ONLY if it belongs to the window that resolved."""
@@ -483,6 +528,9 @@ class BotRunner:
                 "farm_reward_session": round(self._farm_reward_session, 4),
                 "arbs_done": len(self._arbed),
                 "active": (signal.mode if signal else "NONE"),
+                "late_mom_enabled": config.LATE_MOMENTUM_ENABLED,
+                "late_mom_open": len(self._late_mom),
+                "late_mom_session": round(self._late_mom_session, 2),
             },
             "position": state.get_open_position(),
             "recent_trades": state.get_recent_trades(limit=20),

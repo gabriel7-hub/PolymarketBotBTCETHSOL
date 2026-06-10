@@ -56,6 +56,14 @@ MIN_EV_TAKER         = 0.03    # min fee-net EV per share ($) to fire an IOC tak
                                # 0.015 after out-of-sample validation: 0.03 cleared the coin-flip
                                # fee-peak zone and gave the best held-out P&L at vol_mult=0.7.
 MIN_EV_MAKER         = 0.005   # min EV per share ($) for a rebate-farm maker quote
+MIN_TAKER_ENTRY      = 0.50    # never IOC a side whose ask is below this. VPS data (684 resolved
+                               # trades, 2026-06-07..10): entries <0.20 won 5.5% vs 12.7% implied
+                               # (model said 14-21%) — the Gaussian barrier tails are badly over-
+                               # confident, mostly right at zone-open (t_rem≈215-219). Sub-0.35
+                               # entries netted −$431; 0.35-0.50 was breakeven noise (±$250/day,
+                               # +$23 net). The entire edge lives at 0.50-0.65 (+$509). Replay with
+                               # this floor: +$661 on 464 trades vs +$253 on all 684. Revisit with
+                               # `backtest.py --buckets` once a bucket shows real edge.
 MAX_SPREAD           = 0.06    # skip if order book spread is wider than this
 MAX_SLIPPAGE         = 0.02    # 2¢: cancel if ask moves more than this before fill
 
@@ -127,6 +135,25 @@ ARB_ENABLED          = True
 MIN_ARB_EDGE         = 0.005   # min locked profit per pair ($/share) after both taker fees
 ARB_SIZE_USDC        = 25.0    # notional per arb pair leg
 TICK_SIZE            = "0.01"  # Polymarket CLOB tick size for BTC markets
+
+# ─── Late-Window Momentum (EXPERIMENTAL · paper-only · OFF by default) ──────────
+# Hypothesis tested on 258 recorded windows: near expiry, when one side DECISIVELY
+# leads, the book under-prices it — that side wins more often than its ask implies
+# (~81–90% when ask>0.5 at T-20s). Adding a bet on the late leader nudged net
+# +$615→+$664 in-sample and +$320→+$370 out-of-sample (70/30 split) — BUT on only
+# ~10 OOS bets and with optimistic fills (it assumes we fill at the snapshot ask while
+# the leader's price is rising). So we MEASURE it in paper first, exactly like the
+# VOL_MULT fix. This is NOT a hedge / loss-recovery (blind hedging lost money); it is a
+# standalone +EV directional signal. The leg is an isolated SHADOW: it writes its own
+# leg='LATE_MOM' ledger rows, never opens a real position, never touches the risk guard
+# or the taker leg, and is hard-gated to paper mode (cannot place a live order).
+LATE_MOMENTUM_ENABLED    = False   # master switch. False = complete no-op.
+LATE_MOMENTUM_THRESHOLD  = 0.62    # only bet the leader if its ask ≥ this (conservative;
+                                   # the in-sample-peak was 0.65 — deliberately NOT tuned to it)
+LATE_MOMENTUM_MAX_ASK    = 0.90    # don't chase near-certainties (fee makes EV ≤0 past here)
+LATE_MOMENTUM_ZONE_START = 25      # secs remaining: late-momentum window opens
+LATE_MOMENTUM_ZONE_END   = 12      # secs remaining: stop (stay out of the latency-dead final ~10s)
+LATE_MOMENTUM_SIZE_USDC  = 25.0    # paper notional per late-momentum bet
 
 # ─── Fee Constants (Fee Structure V2, effective Mar 30 2026) ───────────────────
 # Crypto taker fee = C × 0.07 × p × (1−p), per share. Makers pay zero.

@@ -240,6 +240,53 @@ def report_pnl(pnls):
     print(f"  max drawdown  : ${mdd:.2f}")
 
 
+def report_buckets(db_path: str):
+    """
+    Calibration of EXECUTED trades by entry price, from the positions table — works on
+    any state.db copy (pass --db for a downloaded VPS file). This is the evidence base
+    for MIN_TAKER_ENTRY: a bucket only pays if its actual win rate beats its average
+    entry price plus the taker fee. The 2026-06-10 audit showed all edge in 0.50-0.65
+    and pure bleed below 0.35; rerun this as data accrues before moving the floor.
+    """
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("""
+        SELECT entry_price, pnl_usdc, (outcome = 'WIN') AS win
+        FROM positions
+        WHERE status = 'RESOLVED' AND order_type = 'TAKER'
+    """).fetchall()
+    conn.close()
+    if not rows:
+        print(f"No resolved taker positions in {db_path}.")
+        return
+
+    print(f"\nEXECUTED-TRADE CALIBRATION by entry price  ({len(rows)} resolved takers, {db_path})")
+    print(f"  current MIN_TAKER_ENTRY = {config.MIN_TAKER_ENTRY}")
+    print(f"  {'bucket':<12}{'n':>5}{'win%':>8}{'breakeven%':>12}{'edge_pts':>10}{'net P&L':>11}  verdict")
+    edges = [(0.0, 0.2), (0.2, 0.35), (0.35, 0.5), (0.5, 0.65), (0.65, 0.8), (0.8, 1.0)]
+    for lo, hi in edges:
+        sub = [r for r in rows if lo <= r[0] < hi]
+        if not sub:
+            continue
+        n = len(sub)
+        win = 100.0 * sum(r[2] for r in sub) / n
+        avg_entry = sum(r[0] for r in sub) / n
+        # Breakeven win rate = entry + fee (fee in $/share == probability points here).
+        breakeven = 100.0 * (avg_entry + pricing.taker_fee_per_share(avg_entry))
+        edge = win - breakeven
+        pnl = sum(r[1] for r in sub)
+        if n < 50:
+            verdict = "too few trades"
+        elif edge >= 3:
+            verdict = "EDGE"
+        elif edge <= -3:
+            verdict = "BLEED — keep below floor"
+        else:
+            verdict = "breakeven"
+        print(f"  {f'{lo:.2f}-{hi:.2f}':<12}{n:>5}{win:>8.1f}{breakeven:>12.1f}"
+              f"{edge:>+10.1f}{pnl:>11.2f}  {verdict}")
+    print("  (need ≥50 trades/bucket and edge_pts ≥ +3 before lowering MIN_TAKER_ENTRY)")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -252,7 +299,16 @@ def main():
                     help="fraction of windows used for training in --validate (default 0.7)")
     ap.add_argument("--include-fallback", action="store_true",
                     help="also use oracle-fallback-resolved windows (circular — inspection only)")
+    ap.add_argument("--buckets", action="store_true",
+                    help="executed-trade win rate vs breakeven by entry-price bucket "
+                         "(evidence for MIN_TAKER_ENTRY)")
+    ap.add_argument("--db", default=config.DB_PATH,
+                    help="state.db to read for --buckets (e.g. a downloaded VPS copy)")
     args = ap.parse_args()
+
+    if args.buckets:
+        report_buckets(args.db)
+        return
 
     rows = _load(include_fallback=args.include_fallback)
     if not rows:
