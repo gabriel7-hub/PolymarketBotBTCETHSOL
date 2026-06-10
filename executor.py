@@ -112,6 +112,59 @@ class Executor:
         logger.warning("Live FARM execution not implemented this round")
         return 0.0
 
+    def box_position(self, window: MarketWindow, pos: dict, opp_ask: float) -> Optional[float]:
+        """
+        Hedge-to-box stop-loss: buy the OPPOSITE side of the open taker position, share
+        for share, so the pair redeems a guaranteed $1 regardless of outcome. Locks a
+        small defined loss (occasionally a gain) instead of riding a flipped signal to a
+        full-stake loss. Returns the locked P&L, or None if the order failed.
+        """
+        side      = pos["side"]
+        opp_side  = "DOWN" if side == "UP" else "UP"
+        entry     = pos["entry_price"]
+        size_usdc = pos["size_usdc"]
+        shares    = size_usdc / entry
+        hedge_usdc = shares * opp_ask
+
+        # Locked P&L: $1/pair redemption minus both legs' cost and taker fees.
+        pnl = (shares
+               - size_usdc - shares * pricing.taker_fee_per_share(entry)
+               - hedge_usdc - shares * pricing.taker_fee_per_share(opp_ask))
+
+        if not self.paper_mode:
+            token_id = window.up_token_id if opp_side == "UP" else window.down_token_id
+            try:
+                options = PartialCreateOrderOptions(
+                    tick_size=window.tick_size, neg_risk=window.neg_risk,
+                    time_in_force="IOC",
+                )
+                self._client.create_and_post_order(
+                    OrderArgs(token_id=token_id, price=opp_ask, size=hedge_usdc, side=BUY),
+                    options=options,
+                )
+            except Exception as exc:
+                logger.error(f"Box hedge order failed: {exc}")
+                return None
+
+        state.close_position(pos["id"], opp_ask, round(pnl, 4), 0.0, "BOXED")
+        state.resolve_taker_ledger(pos["market_id"], "BOXED", round(pnl, 4))
+        state.record_trade({
+            "market_id": pos["market_id"], "start_ts": int(window.start_ts),
+            "leg": "BOX", "side": opp_side, "price": opp_ask,
+            "detail": f"box {side}@{entry:.3f} + {opp_side}@{opp_ask:.3f} "
+                      f"({shares:.1f}sh, locked {pnl:+.2f})",
+            "size_usdc": round(hedge_usdc, 2), "pnl_usdc": 0.0,
+            "status": "RESOLVED", "outcome": "BOXED", "closed_at": time.time(),
+        })
+        logger.info(
+            f"[{'PAPER' if self.paper_mode else 'LIVE'}][BOX] {side}@{entry:.3f} hedged with "
+            f"{opp_side}@{opp_ask:.3f} | locked pnl={pnl:+.2f}"
+        )
+        self._active_order_id   = None
+        self._active_pos_id     = None
+        self._active_order_type = None
+        return pnl
+
     def _ledger_open_taker(self, window, side, price, size_usdc) -> int:
         """Append a TAKER fill to the audit ledger (OPEN until the window resolves)."""
         return state.record_trade({

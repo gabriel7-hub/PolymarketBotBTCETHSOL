@@ -64,6 +64,13 @@ MIN_TAKER_ENTRY      = 0.50    # never IOC a side whose ask is below this. VPS d
                                # +$23 net). The entire edge lives at 0.50-0.65 (+$509). Replay with
                                # this floor: +$661 on 464 trades vs +$253 on all 684. Revisit with
                                # `backtest.py --buckets` once a bucket shows real edge.
+BOX_STOP_ENABLED     = True    # hedge-to-box stop-loss on the open taker position
+BOX_STOP_MARGIN      = 0.10    # box (buy the opposite side, locking $1/pair) when
+                               # p_side < 1 − opposite_ask − margin. Validated on 464
+                               # recorded positions (2026-06-10): hold-to-resolution $662 →
+                               # $809 boxed, avg loss −$26 → −$14; margins 0.08–0.15 all
+                               # beat holding (broad plateau). Tighter margins over-trigger
+                               # on model noise (boxed trades that would have won).
 MAX_SPREAD           = 0.06    # skip if order book spread is wider than this
 MAX_SLIPPAGE         = 0.02    # 2¢: cancel if ask moves more than this before fill
 

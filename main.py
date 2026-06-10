@@ -242,6 +242,9 @@ class BotRunner:
                         logger.info(f"[PAPER·EXPERIMENTAL] late-momentum "
                                     f"{signal.order_side}@{signal.order_price:.2f}")
 
+                # Box-stop: hedge the open taker into a $1 box if the signal flipped.
+                self._maybe_box_position(signal, window)
+
                 # Window closing: queue for resolution and snapshot the settle price
                 # (oracle price at close) — used as the paper fallback if the real
                 # on-chain outcome never arrives.
@@ -413,6 +416,34 @@ class BotRunner:
         logger.info(f"[PAPER·EXPERIMENTAL] late-momentum {lm['side']} "
                     f"{'WIN' if won else 'LOSS'} pnl={pnl:+.2f} "
                     f"(session {self._late_mom_session:+.2f})")
+
+    def _maybe_box_position(self, signal, window):
+        """
+        Hedge-to-box stop-loss (see BOX_STOP_MARGIN in config.py). Each tick, if the
+        model probability of our open taker's side has collapsed enough that buying the
+        opposite side — locking $1/pair — beats holding by the margin, box it. The
+        leaderboard winners' loss-capping mechanic: they never ride a flipped window to
+        a full-stake loss, and neither should we.
+        """
+        if not config.BOX_STOP_ENABLED or not window.has_reference:
+            return
+        if window.time_remaining < 3:        # too late to expect the hedge to fill
+            return
+        pos = state.get_open_position()
+        if (not pos or pos["market_id"] != window.condition_id
+                or pos["order_type"] != "TAKER"):
+            return
+        if pos["side"] == "UP":
+            p_side, opp_ask = signal.p_up, signal.down_ask
+        else:
+            p_side, opp_ask = signal.p_down, signal.up_ask
+        if opp_ask is None or opp_ask >= 1.0:
+            return
+        if p_side < 1.0 - opp_ask - config.BOX_STOP_MARGIN:
+            pnl = self.executor.box_position(window, pos, opp_ask)
+            if pnl is not None and pnl < 0:
+                # A boxed loss is still a wrong call — count it for the cooldown.
+                self.risk.on_loss()
 
     def _resolve_position(self, condition_id: str, winning_side: str):
         """Resolve the open position ONLY if it belongs to the window that resolved."""
