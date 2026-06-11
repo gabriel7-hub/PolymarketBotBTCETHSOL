@@ -1,7 +1,8 @@
 """
-state.py — SQLite persistence layer.
-Tables: positions, trades, signals, daily_summary.
-Thread-safe via connection-per-call pattern.
+state.py — SQLite persistence layer (multi-asset: every row is tagged with its asset).
+Tables: positions, trades, signals, ticks, outcomes, daily_summary.
+Thread-safe via connection-per-call pattern; daily_summary stays GLOBAL across assets
+(one shared bankroll / one daily-loss limit).
 """
 
 import sqlite3
@@ -15,6 +16,9 @@ def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # Three asset workers write concurrently; without a busy timeout a writer that
+    # collides with another thread's transaction raises SQLITE_BUSY immediately.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -116,17 +120,20 @@ def init_db():
                 closed_at   REAL
             );
 
-            -- True settlement outcome per window (from Polymarket resolution, M1).
+            -- True settlement outcome per (asset, window) (from Polymarket resolution).
+            -- Composite PK: BTC/ETH/SOL windows share the same start_ts grid.
             CREATE TABLE IF NOT EXISTS outcomes (
-                start_ts        INTEGER PRIMARY KEY,
+                asset           TEXT NOT NULL DEFAULT 'BTC',
+                start_ts        INTEGER NOT NULL,
                 market_id       TEXT,
                 ref_price       REAL,
                 settle_price    REAL,
                 winning_side    TEXT,           -- 'UP' or 'DOWN'
                 predicted_side  TEXT,           -- oracle-derived diagnostic, NOT truth
                 resolved_at     REAL,
-                resolution_source TEXT          -- 'REAL' (Polymarket) | 'FALLBACK' (our oracle).
+                resolution_source TEXT,         -- 'REAL' (Polymarket) | 'FALLBACK' (our oracle).
                                                 -- Calibrate (backtest.py) on REAL only.
+                PRIMARY KEY (asset, start_ts)
             );
 
             CREATE INDEX IF NOT EXISTS idx_signals_ts      ON signals(ts);
@@ -134,24 +141,66 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_ticks_start     ON ticks(start_ts);
             CREATE INDEX IF NOT EXISTS idx_trades_ts       ON trades(ts);
         """)
-        # Migration: add resolution_source to outcomes tables created before this column.
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(outcomes)").fetchall()]
-        if "resolution_source" not in cols:
-            conn.execute("ALTER TABLE outcomes ADD COLUMN resolution_source TEXT")
-    logger.info(f"Database initialised at {config.DB_PATH}")
+        _migrate_multi_asset(conn)
+    logger.info(f"Database initialised at {config.DB_PATH} (assets: {', '.join(config.ASSETS)})")
+
+
+def _migrate_multi_asset(conn: sqlite3.Connection):
+    """
+    Upgrade a pre-multi-asset database in place. All pre-existing rows were BTC.
+      1. positions/signals/ticks/trades gain an `asset` column (default 'BTC').
+      2. outcomes moves from PRIMARY KEY(start_ts) to PRIMARY KEY(asset, start_ts) —
+         SQLite can't alter a PK, so the table is rebuilt and rows copied as BTC.
+    Idempotent: runs once, no-ops on an already-migrated DB.
+    """
+    for table in ("positions", "signals", "ticks", "trades"):
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if cols and "asset" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN asset TEXT NOT NULL DEFAULT 'BTC'")
+            logger.info(f"Migration: added asset column to {table}")
+
+    out_cols = [r[1] for r in conn.execute("PRAGMA table_info(outcomes)").fetchall()]
+    if out_cols and "resolution_source" not in out_cols:
+        conn.execute("ALTER TABLE outcomes ADD COLUMN resolution_source TEXT")
+        out_cols.append("resolution_source")
+    if out_cols and "asset" not in out_cols:
+        conn.executescript("""
+            ALTER TABLE outcomes RENAME TO outcomes_v1;
+            CREATE TABLE outcomes (
+                asset           TEXT NOT NULL DEFAULT 'BTC',
+                start_ts        INTEGER NOT NULL,
+                market_id       TEXT,
+                ref_price       REAL,
+                settle_price    REAL,
+                winning_side    TEXT,
+                predicted_side  TEXT,
+                resolved_at     REAL,
+                resolution_source TEXT,
+                PRIMARY KEY (asset, start_ts)
+            );
+            INSERT INTO outcomes
+                (asset, start_ts, market_id, ref_price, settle_price,
+                 winning_side, predicted_side, resolved_at, resolution_source)
+            SELECT 'BTC', start_ts, market_id, ref_price, settle_price,
+                   winning_side, predicted_side, resolved_at, resolution_source
+            FROM outcomes_v1;
+            DROP TABLE outcomes_v1;
+        """)
+        logger.info("Migration: rebuilt outcomes with PRIMARY KEY (asset, start_ts)")
 
 
 # ─── Recorder (M4) ────────────────────────────────────────────────────────────
 
 def insert_tick(data: dict):
+    data.setdefault("asset", "BTC")
     with _conn() as conn:
         conn.execute("""
             INSERT INTO ticks
-              (ts, market_id, start_ts, t_remaining, binance_price, oracle_price,
+              (asset, ts, market_id, start_ts, t_remaining, binance_price, oracle_price,
                cex_basis_bp, realized_vol, ref_price, momentum_bp, p_up, sigma_price,
                up_bid, up_ask, down_bid, down_ask, ev_up, ev_down, action, mode)
             VALUES
-              (:ts, :market_id, :start_ts, :t_remaining, :binance_price, :oracle_price,
+              (:asset, :ts, :market_id, :start_ts, :t_remaining, :binance_price, :oracle_price,
                :cex_basis_bp, :realized_vol, :ref_price, :momentum_bp, :p_up, :sigma_price,
                :up_bid, :up_ask, :down_bid, :down_ask, :ev_up, :ev_down, :action, :mode)
         """, data)
@@ -159,15 +208,16 @@ def insert_tick(data: dict):
 
 def upsert_outcome(data: dict):
     data.setdefault("resolution_source", None)
+    data.setdefault("asset", "BTC")
     with _conn() as conn:
         conn.execute("""
             INSERT INTO outcomes
-              (start_ts, market_id, ref_price, settle_price, winning_side,
+              (asset, start_ts, market_id, ref_price, settle_price, winning_side,
                predicted_side, resolved_at, resolution_source)
             VALUES
-              (:start_ts, :market_id, :ref_price, :settle_price, :winning_side,
+              (:asset, :start_ts, :market_id, :ref_price, :settle_price, :winning_side,
                :predicted_side, :resolved_at, :resolution_source)
-            ON CONFLICT(start_ts) DO UPDATE SET
+            ON CONFLICT(asset, start_ts) DO UPDATE SET
                 winning_side      = excluded.winning_side,
                 settle_price      = excluded.settle_price,
                 predicted_side    = excluded.predicted_side,
@@ -176,10 +226,10 @@ def upsert_outcome(data: dict):
         """, data)
 
 
-def get_outcome(start_ts: int) -> Optional[dict]:
+def get_outcome(start_ts: int, asset: str = "BTC") -> Optional[dict]:
     with _conn() as conn:
         row = conn.execute(
-            "SELECT * FROM outcomes WHERE start_ts = ?", (start_ts,)
+            "SELECT * FROM outcomes WHERE asset = ? AND start_ts = ?", (asset, start_ts)
         ).fetchone()
         return dict(row) if row else None
 
@@ -191,12 +241,13 @@ def record_trade(data: dict) -> int:
     with _conn() as conn:
         cur = conn.execute("""
             INSERT INTO trades
-              (ts, market_id, start_ts, leg, side, price, detail, size_usdc,
+              (asset, ts, market_id, start_ts, leg, side, price, detail, size_usdc,
                pnl_usdc, status, outcome, closed_at)
             VALUES
-              (:ts, :market_id, :start_ts, :leg, :side, :price, :detail, :size_usdc,
+              (:asset, :ts, :market_id, :start_ts, :leg, :side, :price, :detail, :size_usdc,
                :pnl_usdc, :status, :outcome, :closed_at)
         """, {
+            "asset": data.get("asset", "BTC"),
             "ts": data.get("ts", time.time()),
             "market_id": data.get("market_id"), "start_ts": data.get("start_ts"),
             "leg": data["leg"], "side": data.get("side"), "price": data.get("price"),
@@ -218,18 +269,19 @@ def update_trade(trade_id: int, **fields):
 
 
 def record_farm_accrual(start_ts: int, market_id: str, side: str, detail: str,
-                        size_usdc: float, reward_delta: float):
+                        size_usdc: float, reward_delta: float, asset: str = "BTC"):
     """
     Accumulate the reward farm into ONE ledger row per window (not per tick).
     Creates the row on first accrual, then adds reward_delta on each tick.
+    Keyed by market_id (unique per asset-window; start_ts collides across assets).
     """
     if reward_delta <= 0:
         return
     now = time.time()
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, pnl_usdc FROM trades WHERE start_ts = ? AND leg = 'FARM'",
-            (start_ts,)
+            "SELECT id, pnl_usdc FROM trades WHERE market_id = ? AND leg = 'FARM'",
+            (market_id,)
         ).fetchone()
         if row:
             conn.execute(
@@ -239,10 +291,10 @@ def record_farm_accrual(start_ts: int, market_id: str, side: str, detail: str,
         else:
             conn.execute("""
                 INSERT INTO trades
-                  (ts, market_id, start_ts, leg, side, price, detail, size_usdc,
+                  (asset, ts, market_id, start_ts, leg, side, price, detail, size_usdc,
                    pnl_usdc, status, outcome, closed_at)
-                VALUES (?, ?, ?, 'FARM', ?, NULL, ?, ?, ?, 'ACCRUING', 'FARM', ?)
-            """, (now, market_id, start_ts, side, detail, size_usdc, reward_delta, now))
+                VALUES (?, ?, ?, ?, 'FARM', ?, NULL, ?, ?, ?, 'ACCRUING', 'FARM', ?)
+            """, (asset, now, market_id, start_ts, side, detail, size_usdc, reward_delta, now))
 
 
 def get_recent_ledger(limit: int = 25) -> list:
@@ -295,13 +347,14 @@ def get_position_by_market(market_id: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
-def get_recent_fallback_windows(limit: int = 50) -> list:
-    """(start_ts, market_id) of windows we settled by oracle FALLBACK — candidates to
-    re-check against the real Chainlink outcome and correct if they disagree."""
+def get_recent_fallback_windows(limit: int = 50, asset: str = "BTC") -> list:
+    """(start_ts, market_id) of this asset's windows we settled by oracle FALLBACK —
+    candidates to re-check against the real Chainlink outcome and correct if they disagree."""
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT start_ts, market_id FROM outcomes WHERE resolution_source='FALLBACK' "
-            "ORDER BY start_ts DESC LIMIT ?", (limit,)
+            "SELECT start_ts, market_id FROM outcomes "
+            "WHERE resolution_source='FALLBACK' AND asset = ? "
+            "ORDER BY start_ts DESC LIMIT ?", (asset, limit)
         ).fetchall()
         return [(r["start_ts"], r["market_id"]) for r in rows]
 
@@ -394,27 +447,29 @@ def add_arb_pnl(amount: float):
 
 
 def insert_signal(data: dict):
+    data.setdefault("asset", "BTC")
     with _conn() as conn:
         conn.execute("""
             INSERT INTO signals
-              (ts, market_id, btc_ref, btc_now, distance_bp, momentum_bp,
+              (asset, ts, market_id, btc_ref, btc_now, distance_bp, momentum_bp,
                time_remaining, p_up, p_down, up_ask, down_ask,
                edge_up, edge_down, action, reason, phase)
             VALUES
-              (:ts, :market_id, :btc_ref, :btc_now, :distance_bp, :momentum_bp,
+              (:asset, :ts, :market_id, :btc_ref, :btc_now, :distance_bp, :momentum_bp,
                :time_remaining, :p_up, :p_down, :up_ask, :down_ask,
                :edge_up, :edge_down, :action, :reason, :phase)
         """, data)
 
 
 def open_position(data: dict) -> int:
+    data.setdefault("asset", "BTC")
     with _conn() as conn:
         cur = conn.execute("""
             INSERT INTO positions
-              (market_id, market_title, side, entry_price, size_usdc,
+              (asset, market_id, market_title, side, entry_price, size_usdc,
                order_id, order_type, status, opened_at)
             VALUES
-              (:market_id, :market_title, :side, :entry_price, :size_usdc,
+              (:asset, :market_id, :market_title, :side, :entry_price, :size_usdc,
                :order_id, :order_type, 'OPEN', :opened_at)
         """, data)
         return cur.lastrowid
@@ -444,11 +499,19 @@ def cancel_position(pos_id: int):
         """, (time.time(), pos_id))
 
 
-def get_open_position() -> Optional[dict]:
+def get_open_position(asset: Optional[str] = None) -> Optional[dict]:
+    """Latest OPEN position — scoped to one asset when given (each asset worker may
+    hold at most one position; an open BTC taker must not block an ETH entry)."""
     with _conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        if asset:
+            row = conn.execute(
+                "SELECT * FROM positions WHERE status = 'OPEN' AND asset = ? "
+                "ORDER BY id DESC LIMIT 1", (asset,)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
         return dict(row) if row else None
 
 
@@ -522,6 +585,26 @@ def get_daily_stats(date_str: Optional[str] = None) -> dict:
             return dict(row)
         return {"date": date_str, "trades": 0, "wins": 0, "losses": 0,
                 "gross_profit": 0, "gross_loss": 0, "net_pnl": 0, "rebates": 0}
+
+
+def get_asset_day_stats(asset: str) -> dict:
+    """
+    Today's taker results for ONE asset, derived from the positions table (the global
+    daily_summary is shared across assets). Used by the dashboard's per-asset tabs.
+    BOXED exits count in net P&L but not in the win/loss denominators.
+    """
+    import datetime
+    midnight = time.mktime(datetime.date.today().timetuple())
+    with _conn() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*)                                        AS trades,
+                   COALESCE(SUM(pnl_usdc), 0)                      AS net_pnl,
+                   COALESCE(SUM(outcome = 'WIN'), 0)               AS wins,
+                   COALESCE(SUM(outcome = 'LOSS'), 0)              AS losses
+            FROM positions
+            WHERE asset = ? AND status = 'RESOLVED' AND closed_at >= ?
+        """, (asset, midnight)).fetchone()
+        return dict(row)
 
 
 def get_overall_stats() -> dict:

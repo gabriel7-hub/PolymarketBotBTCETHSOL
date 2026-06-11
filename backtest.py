@@ -25,27 +25,40 @@ import pricing
 from signal_engine import barrier_p_up
 
 
-def _load(include_fallback: bool = False):
+def _load(include_fallback: bool = False, asset: str = None, db_path: str = None):
     """
-    Return tick rows joined to their resolved outcome. By default ONLY windows resolved
-    from the REAL Polymarket outcome are used: fallback windows were settled on our own
-    oracle price (the model's own input), so calibrating on them is circular and makes the
-    model look better than it is. Pass include_fallback=True to inspect everything.
+    Return tick rows joined to their resolved outcome (multi-asset: joined on BOTH
+    asset and start_ts — BTC/ETH/SOL windows share the same start_ts grid). By default
+    ONLY windows resolved from the REAL Polymarket outcome are used: fallback windows
+    were settled on our own oracle price (the model's own input), so calibrating on them
+    is circular and makes the model look better than it is. Pass include_fallback=True
+    to inspect everything; pass asset='ETH' etc. to filter one asset.
     """
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = sqlite3.connect(db_path or config.DB_PATH)
     conn.row_factory = sqlite3.Row
     src_filter = "" if include_fallback else "AND o.resolution_source = 'REAL'"
+    asset_filter = "AND t.asset = :asset" if asset else ""
     rows = conn.execute(f"""
         SELECT t.*, o.winning_side
         FROM ticks t
-        JOIN outcomes o ON o.start_ts = t.start_ts
+        JOIN outcomes o ON o.asset = t.asset AND o.start_ts = t.start_ts
         WHERE o.winning_side IN ('UP', 'DOWN')
           {src_filter}
+          {asset_filter}
           AND t.ref_price > 0 AND t.oracle_price > 0
         ORDER BY t.ts
-    """).fetchall()
+    """, {"asset": asset}).fetchall()
     conn.close()
     return rows
+
+
+def _wkey(r):
+    """Window key: (asset, start_ts) — start_ts alone collides across assets."""
+    try:
+        a = r["asset"]
+    except (KeyError, IndexError):
+        a = "BTC"
+    return (a or "BTC", r["start_ts"])
 
 
 def _p_up(r, vol_mult: float) -> float:
@@ -93,12 +106,12 @@ def simulate_taker(rows, vol_mult: float, min_ev: float = None):
     """One trade per window: first tick in the taker zone that clears min_ev
     (defaults to config.MIN_EV_TAKER)."""
     min_ev = config.MIN_EV_TAKER if min_ev is None else min_ev
-    by_window: dict[int, list] = {}
+    by_window: dict[tuple, list] = {}
     for r in rows:
-        by_window.setdefault(r["start_ts"], []).append(r)
+        by_window.setdefault(_wkey(r), []).append(r)
 
     pnls = []
-    for start_ts, ticks in by_window.items():
+    for wkey, ticks in by_window.items():
         winning = ticks[0]["winning_side"]
         for r in sorted(ticks, key=lambda x: -x["t_remaining"]):
             t = r["t_remaining"]
@@ -151,14 +164,14 @@ def _pnl_metrics(pnls) -> dict:
 
 
 def _split_chrono(rows, train_frac: float = 0.7):
-    """Split by WINDOW (start_ts) chronologically: earliest train_frac of windows are
-    train, the rest are test. Chronological (not random) so it honestly mimics choosing
+    """Split by WINDOW ((asset, start_ts)) chronologically: earliest train_frac of windows
+    are train, the rest are test. Chronological (not random) so it honestly mimics choosing
     params on past data and trading them forward — no look-ahead leakage across a window."""
-    starts = sorted({r["start_ts"] for r in rows})
+    starts = sorted({_wkey(r) for r in rows}, key=lambda k: (k[1], k[0]))
     cut = int(len(starts) * train_frac)
     train_starts = set(starts[:cut])
-    train = [r for r in rows if r["start_ts"] in train_starts]
-    test = [r for r in rows if r["start_ts"] not in train_starts]
+    train = [r for r in rows if _wkey(r) in train_starts]
+    test = [r for r in rows if _wkey(r) not in train_starts]
     return train, test, len(train_starts), len(starts) - len(train_starts)
 
 
@@ -240,7 +253,7 @@ def report_pnl(pnls):
     print(f"  max drawdown  : ${mdd:.2f}")
 
 
-def report_buckets(db_path: str):
+def report_buckets(db_path: str, asset: str = None):
     """
     Calibration of EXECUTED trades by entry price, from the positions table — works on
     any state.db copy (pass --db for a downloaded VPS file). This is the evidence base
@@ -249,17 +262,21 @@ def report_buckets(db_path: str):
     and pure bleed below 0.35; rerun this as data accrues before moving the floor.
     """
     conn = sqlite3.connect(db_path)
-    rows = conn.execute("""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()]
+    asset_filter = "AND asset = :asset" if (asset and "asset" in cols) else ""
+    rows = conn.execute(f"""
         SELECT entry_price, pnl_usdc, (outcome = 'WIN') AS win
         FROM positions
-        WHERE status = 'RESOLVED' AND order_type = 'TAKER'
-    """).fetchall()
+        WHERE status = 'RESOLVED' AND order_type = 'TAKER' {asset_filter}
+    """, {"asset": asset}).fetchall()
     conn.close()
     if not rows:
         print(f"No resolved taker positions in {db_path}.")
         return
 
-    print(f"\nEXECUTED-TRADE CALIBRATION by entry price  ({len(rows)} resolved takers, {db_path})")
+    label = f", {asset} only" if asset else ""
+    print(f"\nEXECUTED-TRADE CALIBRATION by entry price  "
+          f"({len(rows)} resolved takers, {db_path}{label})")
     print(f"  current MIN_TAKER_ENTRY = {config.MIN_TAKER_ENTRY}")
     print(f"  {'bucket':<12}{'n':>5}{'win%':>8}{'breakeven%':>12}{'edge_pts':>10}{'net P&L':>11}  verdict")
     edges = [(0.0, 0.2), (0.2, 0.35), (0.35, 0.5), (0.5, 0.65), (0.65, 0.8), (0.8, 1.0)]
@@ -299,26 +316,37 @@ def main():
                     help="fraction of windows used for training in --validate (default 0.7)")
     ap.add_argument("--include-fallback", action="store_true",
                     help="also use oracle-fallback-resolved windows (circular — inspection only)")
+    ap.add_argument("--asset", default=None,
+                    help="filter to one asset (BTC/ETH/SOL); default = all recorded assets")
     ap.add_argument("--buckets", action="store_true",
                     help="executed-trade win rate vs breakeven by entry-price bucket "
                          "(evidence for MIN_TAKER_ENTRY)")
     ap.add_argument("--db", default=config.DB_PATH,
-                    help="state.db to read for --buckets (e.g. a downloaded VPS copy)")
+                    help="state.db to read (e.g. a downloaded VPS copy)")
     args = ap.parse_args()
+    asset = args.asset.upper() if args.asset else None
 
     if args.buckets:
-        report_buckets(args.db)
+        report_buckets(args.db, asset=asset)
         return
 
-    rows = _load(include_fallback=args.include_fallback)
+    rows = _load(include_fallback=args.include_fallback, asset=asset, db_path=args.db)
     if not rows:
         print("No REAL-resolved tick data yet. Run `python main.py --mode paper` for a while "
               "to record ticks + outcomes, then re-run backtest.py.\n"
-              "(Most BTC 5-min windows resolve via oracle fallback; use --include-fallback "
+              "(Most 5-min windows resolve via oracle fallback; use --include-fallback "
               "to inspect those, but do NOT calibrate on them.)")
         return
 
-    n_windows = len({r["start_ts"] for r in rows})
+    # Per-asset inventory so a thin asset can't hide inside the combined numbers.
+    by_asset: dict[str, set] = {}
+    for r in rows:
+        a, sts = _wkey(r)
+        by_asset.setdefault(a, set()).add(sts)
+    n_windows = sum(len(v) for v in by_asset.values())
+    print("Recorded REAL-resolved windows: "
+          + "  ".join(f"{a}={len(v)}" for a, v in sorted(by_asset.items()))
+          + f"  (total {n_windows})")
     if n_windows < 100:
         print(f"⚠  Only {n_windows} resolved window(s) of data — far below the ~300 needed "
               f"for trustworthy calibration. Treat results as directional, not final.\n")
@@ -341,6 +369,13 @@ def main():
     else:
         print_calibration(rows, args.vol_mult)
         report_pnl(simulate_taker(rows, args.vol_mult))
+        if not asset and len(by_asset) > 1:
+            print("\nPER-ASSET BREAKDOWN (same params):")
+            for a in sorted(by_asset):
+                sub = [r for r in rows if _wkey(r)[0] == a]
+                m = _pnl_metrics(simulate_taker(sub, args.vol_mult))
+                print(f"  {a}: trades={m['n']}  win={m['win']:.1%}  "
+                      f"net=${m['net']:+.2f}  PF={m['pf']:.2f}")
 
 
 if __name__ == "__main__":

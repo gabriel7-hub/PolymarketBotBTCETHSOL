@@ -1,9 +1,14 @@
 """
-main.py — Entry point for the BTC 5-min Polymarket bot.
+main.py — Entry point for the multi-asset crypto 5-min Polymarket bot (BTC/ETH/SOL).
+
+One AssetWorker per asset: its own feeds (Binance/Coinbase/Chainlink-RTDS), CLOB book,
+window discovery, signal engine, executor, and risk scope — all running concurrent 1s
+loops against a shared SQLite store and one dashboard.
 
 Usage:
-    python main.py --mode paper          # paper trade (default)
-    python main.py --mode live           # live CLOB orders
+    python main.py --mode paper                  # paper trade (default), all configured assets
+    python main.py --mode paper --assets BTC,ETH # subset of config.ASSETS / ASSET_PARAMS
+    python main.py --mode live                   # live CLOB orders
     python main.py --mode paper --no-dashboard   # suppress dashboard server
 """
 
@@ -25,9 +30,11 @@ from risk import RiskGuard
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Polymarket BTC 5-min bot")
+    parser = argparse.ArgumentParser(description="Polymarket crypto 5-min bot (multi-asset)")
     parser.add_argument("--mode", choices=["paper", "live"], default="paper",
                         help="paper = simulate trades; live = real CLOB orders")
+    parser.add_argument("--assets", default=None,
+                        help="comma-separated subset, e.g. BTC,ETH,SOL (default: config.ASSETS)")
     parser.add_argument("--no-dashboard", action="store_true",
                         help="Do not start the WebSocket dashboard server")
     return parser.parse_args()
@@ -44,32 +51,31 @@ def start_dashboard_server(bot_state_fn):
         logger.warning(f"Dashboard server could not start: {exc}")
 
 
-class BotRunner:
+class AssetWorker:
+    """
+    Everything one asset needs to trade its 5-min Up/Down market, isolated from the
+    other assets: feeds, book, discovery, engine, executor, per-asset risk scope,
+    strike snapshots, resolution tracking, and a dashboard snapshot fragment.
+    """
 
-    def __init__(self, paper_mode: bool = True):
+    def __init__(self, asset: str, paper_mode: bool = True):
+        self.asset = asset
         self.paper_mode = paper_mode
-        state.init_db()   # must precede RiskGuard, which reads daily P&L
-        healed = state.reconcile_taker_ledger()       # backfill resolved/cancelled takers in history
-        if healed:
-            logger.info(f"Reconciled {healed} TAKER ledger row(s) with resolved outcomes")
-        pruned = state.prune_old_data(config.TICK_RETENTION_DAYS)  # bound DB growth on VPS
-        if pruned:
-            logger.info(f"Pruned {pruned} old tick/signal row(s) (> {config.TICK_RETENTION_DAYS}d)")
 
-        self.discovery = MarketDiscovery()
-        self.binance   = BinanceFeed()
-        self.oracle    = Oracle(self.binance)         # owns a CoinbaseFeed
-        self.book      = PolymarketBook()
+        self.discovery = MarketDiscovery(asset)
+        self.binance   = BinanceFeed(asset)
+        self.oracle    = Oracle(self.binance, asset)  # owns Coinbase + Chainlink feeds
+        self.book      = PolymarketBook(asset)
         self.engine    = SignalEngine(self.oracle, self.binance, self.book)
-        self.executor  = Executor(paper_mode=paper_mode)
-        self.risk      = RiskGuard(paper_mode=paper_mode)
+        self.executor  = Executor(paper_mode=paper_mode, asset=asset)
+        self.risk      = RiskGuard(paper_mode=paper_mode, asset=asset)
 
-        self._dash_state: dict = {}
+        self.snapshot: dict = {}                 # per-asset dashboard fragment
         self._last_signal = None
         self._current_window_id: str = ""
         self._refs: dict[int, float] = {}        # start_ts -> snapshotted strike
         self._missed: set[int] = set()           # windows we caught too late to strike
-        self._ref_lock = threading.Lock()        # guards _refs/_missed (strike thread + main loop)
+        self._ref_lock = threading.Lock()        # guards _refs/_missed (strike thread + loop)
         self._pending: dict[int, str] = {}       # start_ts -> condition_id awaiting resolution
         self._settles: dict[int, float] = {}     # start_ts -> oracle price snapshotted at close
         self._awaiting_real: dict[int, str] = {} # fallback-settled; still chasing REAL outcome
@@ -77,7 +83,7 @@ class BotRunner:
         self._resolved: set[int] = set()
         self._arbed: set[int] = set()            # windows we already arbed
         self._late_mom: dict[int, dict] = {}     # start_ts -> open late-momentum shadow bet
-        self._late_mom_session: float = 0.0      # paper P&L of the experimental late-momentum leg
+        self._late_mom_session: float = 0.0      # paper P&L of the experimental late-mom leg
         self._last_tick_ts: float = time.time()
         self._farm_reward_session: float = 0.0   # est reward accrued this session
         self._last_farm: dict = {}               # last farm quote details for dashboard
@@ -86,16 +92,18 @@ class BotRunner:
 
     def _readopt_open_positions(self):
         """
-        Re-adopt OPEN positions left by a previous run and queue them for resolution,
-        instead of cancelling them. Cancelling on restart killed in-flight takers so they
-        never got a WIN/LOSS and their history row stayed OPEN. We restore the strike +
-        settle from the outcomes table so the fallback can settle them too.
+        Re-adopt this asset's OPEN positions left by a previous run and queue them for
+        resolution, instead of cancelling them. Cancelling on restart killed in-flight
+        takers so they never got a WIN/LOSS and their history row stayed OPEN. We restore
+        the strike + settle from the outcomes table so the fallback can settle them too.
         """
         adopted = 0
         for pos in state.get_open_positions():
+            if pos.get("asset", "BTC") != self.asset:
+                continue
             start_ts = int(pos["opened_at"] // config.MARKET_WINDOW_SECS) * config.MARKET_WINDOW_SECS
             self._pending[start_ts] = pos["market_id"]
-            o = state.get_outcome(start_ts)
+            o = state.get_outcome(start_ts, self.asset)
             if o:
                 if o.get("ref_price"):
                     self._refs[start_ts] = o["ref_price"]
@@ -103,10 +111,10 @@ class BotRunner:
                     self._settles[start_ts] = o["settle_price"]
             adopted += 1
         if adopted:
-            logger.info(f"Re-adopted {adopted} open position(s) for resolution (not cancelled)")
+            logger.info(f"[{self.asset}] Re-adopted {adopted} open position(s) for resolution")
         # Re-check recent oracle-FALLBACK settlements against the REAL Chainlink outcome and
         # correct any the cross-venue basis got wrong on borderline windows.
-        for start_ts, mkt in state.get_recent_fallback_windows(limit=20):
+        for start_ts, mkt in state.get_recent_fallback_windows(limit=20, asset=self.asset):
             if start_ts not in self._resolved:
                 self._awaiting_real[start_ts] = mkt
 
@@ -115,21 +123,19 @@ class BotRunner:
         self.binance.start()
         self.oracle.start()
         self.book.start()
-        self._start_strike_thread()   # snapshot strikes independent of main-loop stalls
-        logger.info(
-            f"Bot started in {'PAPER' if self.paper_mode else 'LIVE'} mode. "
-            f"Waiting for window and feeds..."
-        )
-        self._main_loop()
+        threading.Thread(target=self._strike_loop, daemon=True,
+                         name=f"strike-{self.asset.lower()}").start()
+        threading.Thread(target=self._main_loop, daemon=True,
+                         name=f"loop-{self.asset.lower()}").start()
+        logger.info(f"[{self.asset}] worker started")
 
-    def _start_strike_thread(self):
-        t = threading.Thread(target=self._strike_loop, daemon=True, name="strike-snapshot")
-        t.start()
+    def stop(self):
+        self._stop.set()
 
     def _strike_loop(self):
         """
         Snapshot the strike at the 300s boundary at high frequency, *independent* of the
-        1s trading loop. The main loop can stall for many seconds on blocking network
+        1s trading loop. The trading loop can stall for many seconds on blocking network
         work (Gamma poll / resolution-fetch retry backoff), which used to push the
         snapshot past REFERENCE_MAX_LAG and flag every window MISSED → no trades. This
         dedicated ticker only reads the async-updated oracle price, so it reliably
@@ -139,11 +145,8 @@ class BotRunner:
             try:
                 self._snapshot_reference(current_window_start())
             except Exception as exc:
-                logger.error(f"Strike snapshot error: {exc}")
+                logger.error(f"[{self.asset}] Strike snapshot error: {exc}")
             self._stop.wait(0.25)
-
-    def get_dashboard_state(self) -> dict:
-        return self._dash_state
 
     # ─── Main loop ─────────────────────────────────────────────────────────────
 
@@ -161,8 +164,8 @@ class BotRunner:
                 if not window or not window.is_active:
                     no_market_ticks += 1
                     if no_market_ticks % 30 == 0:
-                        logger.info("Waiting for active BTC 5-min window...")
-                    self._update_dash_state(window=None)
+                        logger.info(f"[{self.asset}] Waiting for active 5-min window...")
+                    self._update_snapshot(window=None)
                     time.sleep(1)
                     continue
                 no_market_ticks = 0
@@ -177,7 +180,7 @@ class BotRunner:
                         ref = self._refs.get(start_ts, 0.0)
                         missed = start_ts in self._missed
                     logger.info(
-                        f"New window: {window.market_title} | "
+                        f"[{self.asset}] New window: {window.market_title} | "
                         f"ref={ref:.2f}{' (MISSED strike)' if missed else ''} | "
                         f"T-{window.time_remaining:.0f}s"
                     )
@@ -229,6 +232,7 @@ class BotRunner:
                     if (self.paper_mode and config.LATE_MOMENTUM_ENABLED
                             and start_ts not in self._late_mom):
                         tid = state.record_trade({
+                            "asset": self.asset,
                             "market_id": window.condition_id, "start_ts": start_ts,
                             "leg": "LATE_MOM", "side": signal.order_side,
                             "price": signal.order_price, "detail": signal.reason,
@@ -239,7 +243,7 @@ class BotRunner:
                             "side": signal.order_side, "price": signal.order_price,
                             "trade_id": tid,
                         }
-                        logger.info(f"[PAPER·EXPERIMENTAL] late-momentum "
+                        logger.info(f"[PAPER·EXPERIMENTAL][{self.asset}] late-momentum "
                                     f"{signal.order_side}@{signal.order_price:.2f}")
 
                 # Box-stop: hedge the open taker into a $1 box if the signal flipped.
@@ -253,15 +257,11 @@ class BotRunner:
                     if start_ts not in self._settles and self.oracle.price > 0:
                         self._settles[start_ts] = self.oracle.price
 
-                self._update_dash_state(window=window, signal=signal)
+                self._update_snapshot(window=window, signal=signal)
                 time.sleep(1)
 
-            except KeyboardInterrupt:
-                logger.info("Shutting down...")
-                self.executor.cancel_open_order()
-                break
             except Exception as exc:
-                logger.error(f"Main loop error: {exc}", exc_info=True)
+                logger.error(f"[{self.asset}] Main loop error: {exc}", exc_info=True)
                 time.sleep(2)
 
     # ─── Reference snapshot ─────────────────────────────────────────────────────
@@ -288,11 +288,13 @@ class BotRunner:
             px = self.oracle.price
             if px and px > 0 and lag <= config.REFERENCE_MAX_LAG:
                 self._refs[start_ts] = px
-                logger.debug(f"Reference snapshot for {start_ts}: {px:.2f} (lag {lag:.1f}s)")
+                logger.debug(f"[{self.asset}] Reference snapshot for {start_ts}: "
+                             f"{px:.2f} (lag {lag:.1f}s)")
             elif lag > config.REFERENCE_MAX_LAG:
                 reason = "no price feed" if not (px and px > 0) else f"lag {lag:.1f}s"
                 self._missed.add(start_ts)
-                logger.debug(f"Window {start_ts} strike MISSED ({reason}) — will not trade")
+                logger.debug(f"[{self.asset}] Window {start_ts} strike MISSED ({reason}) "
+                             f"— will not trade")
 
     # ─── Resolution (real outcome from Polymarket) ──────────────────────────────
 
@@ -316,17 +318,19 @@ class BotRunner:
                     winning, source = predicted, "FALLBACK"
                     self._awaiting_real[start_ts] = condition_id   # upgrade to REAL later
                 elif time.time() - closed_at >= config.RESOLUTION_GIVEUP_SECS:
-                    pos = state.get_open_position()
+                    pos = state.get_open_position(self.asset)
                     if pos and pos["market_id"] == condition_id:
                         state.cancel_position(pos["id"])
                         state.resolve_taker_ledger(condition_id, "VOID", 0.0)
-                        logger.warning(f"Window {start_ts} unresolvable — position VOIDed")
+                        logger.warning(f"[{self.asset}] Window {start_ts} unresolvable "
+                                       f"— position VOIDed")
                     self._pending.pop(start_ts, None)
                     self._settles.pop(start_ts, None)
                     self._resolved.add(start_ts)
                     continue
                 else:
                     state.upsert_outcome({
+                        "asset": self.asset,
                         "start_ts": start_ts, "market_id": condition_id,
                         "ref_price": ref, "settle_price": settle,
                         "winning_side": None, "predicted_side": predicted,
@@ -335,6 +339,7 @@ class BotRunner:
                     continue
 
             state.upsert_outcome({
+                "asset": self.asset,
                 "start_ts": start_ts, "market_id": condition_id,
                 "ref_price": ref, "settle_price": settle,
                 "winning_side": winning, "predicted_side": predicted,
@@ -343,8 +348,8 @@ class BotRunner:
             self._resolve_position(condition_id, winning)
             self._resolve_late_mom(start_ts, winning)
             if source == "FALLBACK":
-                logger.info(f"Window {start_ts} settled (paper, oracle): {winning} "
-                            f"— chasing real outcome in background")
+                logger.info(f"[{self.asset}] Window {start_ts} settled (paper, oracle): "
+                            f"{winning} — chasing real outcome in background")
             self._pending.pop(start_ts, None)
             self._settles.pop(start_ts, None)
             self._resolved.add(start_ts)
@@ -360,13 +365,14 @@ class BotRunner:
                     self._awaiting_real.pop(start_ts, None)
                     continue
                 if fetched >= config.RESOLUTION_MAX_FETCH_PER_CYCLE:
-                    break   # bound main-loop stall on slow/flaky VPS network
+                    break   # bound loop stall on slow/flaky VPS network
                 fetched += 1
                 winning = self.discovery.fetch_resolution(start_ts)
                 if winning is None:
                     continue
-                o = state.get_outcome(start_ts) or {}
+                o = state.get_outcome(start_ts, self.asset) or {}
                 state.upsert_outcome({
+                    "asset": self.asset,
                     "start_ts": start_ts, "market_id": condition_id,
                     "ref_price": o.get("ref_price") or self._get_ref(start_ts),
                     "settle_price": o.get("settle_price"),
@@ -377,7 +383,8 @@ class BotRunner:
                 # Correct the position if our fast proxy settle disagreed with the REAL
                 # Chainlink outcome (e.g. a borderline window the CEX basis flipped).
                 self._resettle_to_real(condition_id, winning)
-                logger.debug(f"Window {start_ts} REAL outcome captured: {winning} (calibration)")
+                logger.debug(f"[{self.asset}] Window {start_ts} REAL outcome captured: "
+                             f"{winning} (calibration)")
 
     def _resettle_to_real(self, condition_id: str, winning: str):
         import pricing
@@ -392,7 +399,7 @@ class BotRunner:
         new_pnl = ((1.0 - entry) if correct == "WIN" else -entry) * shares - fee * shares
         if state.resettle_position(pos["id"], correct, new_pnl):
             state.update_taker_ledger(condition_id, correct, new_pnl)
-            logger.info(f"Corrected {condition_id} to REAL outcome {winning}: "
+            logger.info(f"[{self.asset}] Corrected {condition_id} to REAL outcome {winning}: "
                         f"{pos['outcome']}→{correct} pnl={new_pnl:+.2f}")
 
     def _resolve_late_mom(self, start_ts: int, winning_side: str):
@@ -413,15 +420,15 @@ class BotRunner:
                            outcome=("WIN" if won else "LOSS"),
                            pnl_usdc=round(pnl, 4), closed_at=time.time())
         self._late_mom_session += pnl
-        logger.info(f"[PAPER·EXPERIMENTAL] late-momentum {lm['side']} "
+        logger.info(f"[PAPER·EXPERIMENTAL][{self.asset}] late-momentum {lm['side']} "
                     f"{'WIN' if won else 'LOSS'} pnl={pnl:+.2f} "
                     f"(session {self._late_mom_session:+.2f})")
 
     def _maybe_box_position(self, signal, window):
         """
-        Hedge-to-box stop-loss (see BOX_STOP_MARGIN_LOSS/_PROFIT in config.py). Each tick, if the
-        model probability of our open taker's side has collapsed enough that buying the
-        opposite side — locking $1/pair — beats holding by the margin, box it. The
+        Hedge-to-box stop-loss (see BOX_STOP_MARGIN_LOSS/_PROFIT in config.py). Each tick,
+        if the model probability of our open taker's side has collapsed enough that buying
+        the opposite side — locking $1/pair — beats holding by the margin, box it. The
         leaderboard winners' loss-capping mechanic: they never ride a flipped window to
         a full-stake loss, and neither should we.
         """
@@ -429,7 +436,7 @@ class BotRunner:
             return
         if window.time_remaining < 3:        # too late to expect the hedge to fill
             return
-        pos = state.get_open_position()
+        pos = state.get_open_position(self.asset)
         if (not pos or pos["market_id"] != window.condition_id
                 or pos["order_type"] != "TAKER"):
             return
@@ -452,15 +459,18 @@ class BotRunner:
 
     def _resolve_position(self, condition_id: str, winning_side: str):
         """Resolve the open position ONLY if it belongs to the window that resolved."""
-        pos = state.get_open_position()
+        pos = state.get_open_position(self.asset)
         if not pos or pos["market_id"] != condition_id:
             return
         window = self.discovery.current
         self.executor.on_market_resolved(window, winning_side)
-        recent = state.get_recent_trades(limit=1)
-        if recent and recent[0]["outcome"] == "WIN":
+        # Read the outcome back from THIS market's position — recent-trades could
+        # surface another asset's resolution and miscount the win/loss streak.
+        resolved = state.get_position_by_market(condition_id)
+        outcome = (resolved or {}).get("outcome")
+        if outcome == "WIN":
             self.risk.on_win()
-        elif recent and recent[0]["outcome"] == "LOSS":
+        elif outcome == "LOSS":
             self.risk.on_loss()
         else:
             self.risk.on_push()
@@ -469,6 +479,7 @@ class BotRunner:
 
     def _record_signal(self, s):
         state.insert_signal({
+            "asset": self.asset,
             "ts": s.ts, "market_id": s.market_id, "btc_ref": s.btc_ref,
             "btc_now": s.btc_now, "distance_bp": s.distance_bp,
             "momentum_bp": s.momentum_bp, "time_remaining": int(s.time_remaining),
@@ -479,6 +490,7 @@ class BotRunner:
 
     def _record_tick(self, s, window):
         state.insert_tick({
+            "asset": self.asset,
             "ts": s.ts, "market_id": s.market_id, "start_ts": int(window.start_ts),
             "t_remaining": s.time_remaining, "binance_price": self.binance.current_price,
             "oracle_price": s.btc_now, "cex_basis_bp": self.oracle.cex_basis_bp,
@@ -489,7 +501,7 @@ class BotRunner:
             "action": s.action, "mode": s.mode,
         })
 
-    # ─── Dashboard state ────────────────────────────────────────────────────────
+    # ─── Dashboard snapshot (per asset) ─────────────────────────────────────────
 
     def _strike_status(self, window) -> str:
         """CAPTURED / MISSED / PENDING — lets the dashboard show strike-thread health."""
@@ -503,27 +515,18 @@ class BotRunner:
                 return "MISSED"
         return "PENDING"
 
-    def _update_dash_state(self, window=None, signal=None):
-        daily = state.get_daily_stats()
-        overall = state.get_overall_stats()
-        trades = daily.get("trades", 0)
-        # Win rate over decided trades only — BOXED positions exited early and can be
-        # neither WIN nor LOSS, so leaving them in the denominator understates the rate.
-        decided = daily.get("wins", 0) + daily.get("losses", 0)
-        win_rate = daily.get("wins", 0) / decided if decided > 0 else 0.0
-
-        self._dash_state = {
-            "ts": time.time(),
-            "bot": {
-                "mode": "PAPER" if self.paper_mode else "LIVE",
-                "status": self.risk.status_str(),
-                "daily_pnl": round(daily.get("net_pnl", 0.0), 2),
-                "daily_trades": trades,
-                "win_rate": round(win_rate, 3),
-                "rebates_today": round(daily.get("rebates", 0.0), 3),
-                "overall_pnl": round(overall.get("net_pnl", 0.0)
-                                     + overall.get("rebates", 0.0), 2),
-                "overall_trades": overall.get("trades", 0),
+    def _update_snapshot(self, window=None, signal=None):
+        day = state.get_asset_day_stats(self.asset)
+        decided = (day.get("wins") or 0) + (day.get("losses") or 0)
+        self.snapshot = {
+            "asset": self.asset,
+            "name": config.ASSET_PARAMS[self.asset]["name"],
+            "day": {
+                "net_pnl": round(day.get("net_pnl") or 0.0, 2),
+                "trades": day.get("trades") or 0,
+                "wins": day.get("wins") or 0,
+                "losses": day.get("losses") or 0,
+                "win_rate": round((day.get("wins") or 0) / decided, 3) if decided else None,
             },
             "market": {
                 "title": window.market_title if window else None,
@@ -535,11 +538,11 @@ class BotRunner:
                 "rewards_max_spread": window.rewards_max_spread if window else None,
                 "rewards_min_size": window.rewards_min_size if window else None,
             },
-            "btc": {
-                "price": round(self.oracle.price, 2),
-                "chainlink": round(self.oracle.chainlink.current_price, 2),
-                "binance": round(self.binance.current_price, 2),
-                "coinbase": round(self.oracle.coinbase.current_price, 2),
+            "px": {
+                "price": round(self.oracle.price, 4),
+                "chainlink": round(self.oracle.chainlink.current_price, 4),
+                "binance": round(self.binance.current_price, 4),
+                "coinbase": round(self.oracle.coinbase.current_price, 4),
                 "basis_bp": round(self.oracle.cex_basis_bp, 2),
                 "momentum_15s": round(self.binance.momentum_15s, 2),
                 "distance_bp": round(signal.distance_bp, 2) if signal else None,
@@ -575,10 +578,79 @@ class BotRunner:
                 "late_mom_open": len(self._late_mom),
                 "late_mom_session": round(self._late_mom_session, 2),
             },
-            "position": state.get_open_position(),
-            "recent_trades": state.get_recent_trades(limit=20),
-            "ledger": state.get_recent_ledger(limit=25),
+            "position": state.get_open_position(self.asset),
+            "risk_status": self.risk.status_str(),
         }
+
+
+class BotRunner:
+    """Owns the shared DB, the asset workers, and the aggregated dashboard state."""
+
+    def __init__(self, paper_mode: bool = True):
+        self.paper_mode = paper_mode
+        state.init_db()   # must precede RiskGuard, which reads daily P&L
+        healed = state.reconcile_taker_ledger()       # backfill resolved/cancelled takers
+        if healed:
+            logger.info(f"Reconciled {healed} TAKER ledger row(s) with resolved outcomes")
+        pruned = state.prune_old_data(config.TICK_RETENTION_DAYS)  # bound DB growth on VPS
+        if pruned:
+            logger.info(f"Pruned {pruned} old tick/signal row(s) (> {config.TICK_RETENTION_DAYS}d)")
+
+        self.workers = {a: AssetWorker(a, paper_mode=paper_mode) for a in config.ASSETS}
+        self._dash_state: dict = {}
+        self._stop = threading.Event()
+
+    def get_dashboard_state(self) -> dict:
+        return self._dash_state
+
+    def start(self):
+        for w in self.workers.values():
+            w.start()
+        logger.info(
+            f"Bot started in {'PAPER' if self.paper_mode else 'LIVE'} mode | "
+            f"assets: {', '.join(self.workers)} | waiting for windows and feeds..."
+        )
+        # The main thread aggregates the dashboard state once per second; the workers
+        # run their own loops. Ctrl-C lands here.
+        try:
+            while not self._stop.is_set():
+                self._update_dash_state()
+                time.sleep(config.STATE_PUSH_INTERVAL)
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+            for w in self.workers.values():
+                w.stop()
+                w.executor.cancel_open_order()
+
+    def _update_dash_state(self):
+        try:
+            daily = state.get_daily_stats()
+            overall = state.get_overall_stats()
+            decided = daily.get("wins", 0) + daily.get("losses", 0)
+            win_rate = daily.get("wins", 0) / decided if decided > 0 else 0.0
+            # Global status: HALTED if the shared daily-loss guard tripped (live), else
+            # the mode label. Per-asset cooldowns show in each asset's risk_status.
+            any_halt = any(w.risk.is_halted for w in self.workers.values())
+            self._dash_state = {
+                "ts": time.time(),
+                "bot": {
+                    "mode": "PAPER" if self.paper_mode else "LIVE",
+                    "status": "HALTED" if any_halt else ("PAPER" if self.paper_mode else "LIVE"),
+                    "assets": list(self.workers.keys()),
+                    "daily_pnl": round(daily.get("net_pnl", 0.0), 2),
+                    "daily_trades": daily.get("trades", 0),
+                    "win_rate": round(win_rate, 3),
+                    "rebates_today": round(daily.get("rebates", 0.0), 3),
+                    "overall_pnl": round(overall.get("net_pnl", 0.0)
+                                         + overall.get("rebates", 0.0), 2),
+                    "overall_trades": overall.get("trades", 0),
+                },
+                "assets": {a: w.snapshot for a, w in self.workers.items() if w.snapshot},
+                "ledger": state.get_recent_ledger(limit=30),
+                "recent_trades": state.get_recent_trades(limit=20),
+            }
+        except Exception as exc:
+            logger.error(f"Dashboard state aggregation error: {exc}")
 
 
 def main():
@@ -586,13 +658,22 @@ def main():
     setup_logging()
     paper_mode = (args.mode == "paper")
 
+    if args.assets:
+        wanted = [a.strip().upper() for a in args.assets.split(",") if a.strip()]
+        bad = [a for a in wanted if a not in config.ASSET_PARAMS]
+        if bad:
+            logger.error(f"Unknown asset(s): {', '.join(bad)} "
+                         f"(available: {', '.join(config.ASSET_PARAMS)})")
+            return
+        config.ASSETS = wanted
+
     if paper_mode:
         logger.info("=" * 60)
-        logger.info("  PAPER MODE — no real orders will be placed")
+        logger.info(f"  PAPER MODE — no real orders | assets: {', '.join(config.ASSETS)}")
         logger.info("=" * 60)
     else:
         logger.warning("=" * 60)
-        logger.warning("  LIVE MODE — real USDC will be at risk")
+        logger.warning(f"  LIVE MODE — real USDC at risk | assets: {', '.join(config.ASSETS)}")
         logger.warning("=" * 60)
         if not config.PRIVATE_KEY or not config.CLOB_API_KEY:
             logger.error("PRIVATE_KEY and CLOB_API_KEY must be set in .env for live mode")

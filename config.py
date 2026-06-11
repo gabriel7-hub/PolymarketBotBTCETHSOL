@@ -1,5 +1,5 @@
 """
-config.py — All tunable constants for the BTC 5-min Polymarket bot.
+config.py — All tunable constants for the crypto 5-min Polymarket bot (BTC/ETH/SOL).
 Edit these to change risk parameters, edge thresholds, and model weights.
 """
 
@@ -18,14 +18,12 @@ WALLET_ADDRESS       = os.getenv("WALLET_ADDRESS", "")
 # ─── API Endpoints ─────────────────────────────────────────────────────────────
 CLOB_HOST            = "https://clob.polymarket.com"
 GAMMA_API            = "https://gamma-api.polymarket.com"
-BINANCE_WS_URL       = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+BINANCE_WS_BASE      = "wss://stream.binance.com:9443/ws"      # /<symbol>@aggTrade
 COINBASE_WS_URL      = "wss://ws-feed.exchange.coinbase.com"   # Chainlink-proxy venue
-COINBASE_PRODUCT     = "BTC-USD"
-# Polymarket Real-Time Data Socket — the ACTUAL Chainlink BTC/USD data-stream price that
-# settles these markets (the "Price to Beat"). No auth. Using this for price + strike makes
-# our Strike(ref) exactly equal Polymarket's published Price to Beat (zero proxy basis).
+# Polymarket Real-Time Data Socket — the ACTUAL Chainlink data-stream price that settles
+# these markets (the "Price to Beat"). No auth. Using this for price + strike makes our
+# Strike(ref) exactly equal Polymarket's published Price to Beat (zero proxy basis).
 CHAINLINK_RTDS_URL   = "wss://ws-live-data.polymarket.com"
-CHAINLINK_SYMBOL     = "btc/usd"
 # The RTDS Chainlink feed is sparse (heartbeat/deviation-driven), so use its price only
 # when it ticked within this many seconds; otherwise fall back to the high-frequency
 # Coinbase proxy so the strike is always captured reliably at T=0.
@@ -33,18 +31,37 @@ CHAINLINK_MAX_STALE  = 8
 POLYMARKET_BOOK_WS   = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 POLYGON_RPC          = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
 
-# ─── Market Target ─────────────────────────────────────────────────────────────
+# ─── Market Target (multi-asset) ───────────────────────────────────────────────
 # 5-min markets are Gamma *events* with slug  "<asset>-updown-5m-<start_unix_ts>",
 # where start_ts is always a unix multiple of MARKET_WINDOW_SECS. We construct the
 # current window's slug directly from the clock instead of scanning the API.
-MARKET_SLUG_PREFIX   = "btc-updown-5m-"       # asset selector (eth-/sol-/xrp- also exist)
-MARKET_TITLE_PATTERN = "Bitcoin Up or Down"   # sanity check on the event title
+# All assets verified live on Gamma 2026-06-11: same schema, tick=0.01, negRisk=False.
 MARKET_WINDOW_SECS   = 300                    # 5 minutes
 
+ASSET_PARAMS = {
+    "BTC": {"name": "Bitcoin",  "binance_symbol": "btcusdt",
+            "coinbase_product": "BTC-USD", "chainlink_symbol": "btc/usd",
+            "slug_prefix": "btc-updown-5m-", "title_pattern": "Bitcoin Up or Down"},
+    "ETH": {"name": "Ethereum", "binance_symbol": "ethusdt",
+            "coinbase_product": "ETH-USD", "chainlink_symbol": "eth/usd",
+            "slug_prefix": "eth-updown-5m-", "title_pattern": "Ethereum Up or Down"},
+    "SOL": {"name": "Solana",   "binance_symbol": "solusdt",
+            "coinbase_product": "SOL-USD", "chainlink_symbol": "sol/usd",
+            "slug_prefix": "sol-updown-5m-", "title_pattern": "Solana Up or Down"},
+    # XRP exists too (xrp-updown-5m-) — add to ASSETS when desired.
+    "XRP": {"name": "XRP",      "binance_symbol": "xrpusdt",
+            "coinbase_product": "XRP-USD", "chainlink_symbol": "xrp/usd",
+            "slug_prefix": "xrp-updown-5m-", "title_pattern": "XRP Up or Down"},
+}
+
+# Assets traded this session (env override: ASSETS=BTC,ETH,SOL,XRP).
+ASSETS = [a.strip().upper() for a in os.getenv("ASSETS", "BTC,ETH,SOL").split(",")
+          if a.strip().upper() in ASSET_PARAMS]
+
 # ─── Risk Limits ───────────────────────────────────────────────────────────────
-MAX_STAKE_PER_MARKET = 25.0    # USDC — max single position size
-MAX_DAILY_LOSS       = 50.0    # USDC — hard halt, no override
-MAX_OPEN_POSITIONS   = 1       # never hold more than 1 position at once
+MAX_STAKE_PER_MARKET = 25.0    # USDC — max single position size (per asset-window)
+MAX_DAILY_LOSS       = 50.0    # USDC — hard halt, GLOBAL across all assets
+MAX_OPEN_POSITIONS   = 1       # never hold more than 1 position at once PER ASSET
 POST_LOSS_COOLDOWN   = 0       # windows to skip after a loss (0 = cooldown disabled)
 MAX_CONSECUTIVE_LOSSES = 0     # halt after this many losses in a row (0 = disabled)
 
@@ -153,7 +170,7 @@ FARM_MAX_MID         = 0.85
 ARB_ENABLED          = True
 MIN_ARB_EDGE         = 0.005   # min locked profit per pair ($/share) after both taker fees
 ARB_SIZE_USDC        = 25.0    # notional per arb pair leg
-TICK_SIZE            = "0.01"  # Polymarket CLOB tick size for BTC markets
+TICK_SIZE            = "0.01"  # Polymarket CLOB tick size for these crypto markets
 
 # ─── Late-Window Momentum (EXPERIMENTAL · paper-only · OFF by default) ──────────
 # Hypothesis tested on 258 recorded windows: near expiry, when one side DECISIVELY

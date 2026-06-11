@@ -1,6 +1,6 @@
 # PolymarketBot — CLAUDE.md
 
-**Market:** Polymarket BTC Up/Down 5-Minute  
+**Market:** Polymarket BTC / ETH / SOL Up/Down 5-Minute (multi-asset since 2026-06-11)  
 **Strategy:** Calibrated fair-value engine → (1) fee-net IOC taker, (2) rebate/reward farming  
 **Edge:** A correctly-modeled, vol-calibrated probability vs a sometimes-stale order book, traded only when expected value clears the actual per-price fee. Plus maker rebates as yield.
 
@@ -13,7 +13,25 @@
 
 ---
 
-## Project Status (2026-06-06)
+## Project Status (2026-06-11) — FINAL paper-trading architecture
+
+**Multi-asset expansion (this round, final):** the bot now trades **BTC, ETH and SOL**
+5-min windows concurrently (XRP defined in `ASSET_PARAMS`, off by default).
+- One **`AssetWorker` per asset** (`main.py`): its own Binance/Coinbase/Chainlink-RTDS
+  feeds, CLOB book socket, window discovery, signal engine, executor, strike thread and
+  1s loop — fully isolated; one asset's stall cannot miss another's strike.
+- **Asset-aware schema**: `asset` column on positions/signals/ticks/trades; `outcomes`
+  rebuilt with `PRIMARY KEY (asset, start_ts)` (the 300s grid collides across assets).
+  Migration is automatic, idempotent, and verified on the real DB (all prior rows = BTC).
+- **Risk**: open-position guard + cooldown are **per asset**; `MAX_DAILY_LOSS` stays
+  **global** (one bankroll). `MAX_STAKE_PER_MARKET` applies per asset-window.
+- **Dashboard**: POLYDESK has asset tabs (per-asset day P&L + open-position dot);
+  trade history shows an Asset column. State shape: `{bot, assets:{BTC,ETH,SOL}, ledger}`.
+- **Backtest**: joins on `(asset, start_ts)`, `--asset` filter, per-asset breakdown.
+  3× window throughput ⇒ the ≥300-window calibration bar fills ~3× faster.
+- Run subsets via `--assets BTC,ETH` or env `ASSETS=...`.
+
+## Previous Status (2026-06-06)
 
 **Foundation rebuild — complete & verified live (paper):**
 - ✅ **Oracle/settlement fixed.** Coinbase-weighted `Oracle` proxy + cross-venue basis;
@@ -75,9 +93,10 @@ mean anything. See Paper→Live Checklist.
 
 ## Market Mechanics
 
-Every 5 minutes: `"Bitcoin Up or Down — June 6, 11:30AM–11:35AM ET"`. Markets are Gamma
-**events** with slug `btc-updown-5m-<start_unix_ts>`, where `start_ts` is a unix multiple
-of 300 → we construct the current window's slug directly from the clock.
+Every 5 minutes per asset: `"Bitcoin/Ethereum/Solana Up or Down — June 6, 11:30AM–11:35AM ET"`.
+Markets are Gamma **events** with slug `<btc|eth|sol>-updown-5m-<start_unix_ts>`, where
+`start_ts` is a unix multiple of 300 → we construct each window's slug directly from the
+clock (all assets share the same grid and the same schema — verified live 2026-06-11).
 - T=0: window opens; **Chainlink BTC/USD (Data Streams)** price is the reference (strike).
 - T=300s: if Chainlink BTC ≥ reference → Up wins ($1.00), else Down wins ($1.00).
 - **Resolution source is `https://data.chain.link/streams/btc-usd`** — NOT Binance. We
@@ -168,20 +187,20 @@ Polymarket CLOB WS (book)─┘   signal_engine.py ──(pricing.py EV)── e
 
 | File | Role |
 |---|---|
-| `config.py` | All constants (model, EV thresholds, timing, risk) |
-| `binance_feed.py` | Binance WS, rolling price, 15s momentum, realized vol |
-| `oracle_feed.py` | Coinbase WS + `Oracle`: settlement-proxy price, CEX basis, vol |
-| `polymarket_book.py` | CLOB WS, local bid/ask book, PING heartbeat, reconnect re-subscribe |
-| `market_discovery.py` | Deterministic slug → event fetch; token IDs, timing, reward params, **real resolution** |
+| `config.py` | All constants; `ASSETS` + `ASSET_PARAMS` (per-asset feeds/slugs/titles) |
+| `binance_feed.py` | Binance WS per asset, rolling price, 15s momentum, realized vol |
+| `oracle_feed.py` | Coinbase + Chainlink-RTDS WS per asset + `Oracle`: settlement price, CEX basis, vol |
+| `polymarket_book.py` | CLOB WS per asset, local bid/ask book, PING heartbeat, reconnect re-subscribe |
+| `market_discovery.py` | Per-asset slug → event fetch; token IDs, timing, reward params, **real resolution** |
 | `signal_engine.py` | `barrier_p_up` model, `FairValueModel`, 3-leg strategy (arb/taker/farm) |
 | `pricing.py` | Fee, EV, `pair_arb_edge`, farm-reward estimate (single source of truth) |
-| `executor.py` | IOC taker, `execute_arb`, `run_farm` via py_clob_client_v2. Paper = log only |
-| `risk.py` | Daily loss halt, consecutive-loss cooldown, open-position guard |
-| `state.py` | SQLite: signals, positions, P&L, **ticks**, **outcomes**; `add_reward`/`add_arb_pnl` |
-| `main.py` | 1s tick loop; clock-driven strike snapshot, recorder, resolution polling, leg routing |
-| `backtest.py` | Forward-test: Brier/calibration + taker P&L on recorded data |
+| `executor.py` | Per-asset: IOC taker, `execute_arb`, `run_farm`, `box_position`. Paper = log only |
+| `risk.py` | Per-asset guard: cooldown + open-position; global daily-loss halt |
+| `state.py` | SQLite (asset-tagged): signals, positions, P&L, **ticks**, **outcomes (PK asset+start_ts)** |
+| `main.py` | `AssetWorker` per asset (1s loop, strike thread, resolution, box-stop) + `BotRunner` aggregator |
+| `backtest.py` | Forward-test: Brier/calibration + taker P&L, per-asset or combined (`--asset`) |
 | `dashboard_server.py` | WebSocket server → pushes JSON state every second |
-| `dashboard/index.html` | POLYDESK dashboard: countdown ring, model-vs-market prob bar, strategy pipeline, EV/arb meters, farm/reward panels, trade log |
+| `dashboard/index.html` | POLYDESK dashboard: asset tabs, countdown ring, model-vs-market prob bar, strategy pipeline, EV/arb meters, farm/reward panels, asset-tagged trade log |
 
 ---
 
@@ -210,11 +229,12 @@ CANCEL_OPEN_AT       = 30      # cancel maker quotes at T-30s
 
 | Stream | URL | Auth |
 |---|---|---|
-| Binance trades | `wss://stream.binance.com:9443/ws/btcusdt@aggTrade` | None |
-| Coinbase trades | `wss://ws-feed.exchange.coinbase.com` (ticker, BTC-USD) | None |
-| Polymarket book | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | None |
+| Binance trades | `wss://stream.binance.com:9443/ws/<btc\|eth\|sol>usdt@aggTrade` (1 socket/asset) | None |
+| Coinbase trades | `wss://ws-feed.exchange.coinbase.com` (ticker, `<BTC\|ETH\|SOL>-USD`, 1 socket/asset) | None |
+| Chainlink RTDS | `wss://ws-live-data.polymarket.com` (`crypto_prices_chainlink`, `<btc\|eth\|sol>/usd`, 1 socket/asset) | None |
+| Polymarket book | `wss://ws-subscriptions-clob.polymarket.com/ws/market` (1 socket/asset) | None |
 | CLOB REST | `https://clob.polymarket.com` | HMAC L2 |
-| Gamma events | `https://gamma-api.polymarket.com/events?slug=btc-updown-5m-<ts>` | None |
+| Gamma events | `https://gamma-api.polymarket.com/events?slug=<btc\|eth\|sol>-updown-5m-<ts>` | None |
 
 Heartbeats: Binance reconnects every 24h (listen for `serverShutdown`). Polymarket needs
 `PING` every 10s or drops, and `polymarket_book` re-subscribes on every (re)connect.
@@ -225,11 +245,17 @@ Heartbeats: Binance reconnects every 24h (listen for `serverShutdown`). Polymark
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env          # no keys needed for paper mode
-python3 main.py --mode paper  # records ticks+outcomes; dashboard at http://localhost:8000/
-python3 backtest.py --sweep   # calibrate σ + measure taker P&L on recorded data
-python3 main.py --mode live   # requires PRIVATE_KEY + CLOB_API_KEY in .env
+cp .env.example .env                    # no keys needed for paper mode
+python3 main.py --mode paper            # all of config.ASSETS (BTC,ETH,SOL); dashboard :8000
+python3 main.py --mode paper --assets BTC,ETH   # subset
+python3 backtest.py --sweep             # calibrate σ on recorded data (all assets)
+python3 backtest.py --asset ETH         # per-asset calibration/P&L
+python3 main.py --mode live             # requires PRIVATE_KEY + CLOB_API_KEY in .env
 ```
+
+Note: on a laptop, OS sleep stalls every feed and windows get flagged MISSED (correct
+behaviour — never trade a window whose open you didn't see). Run on a VPS, or keep the
+machine awake (`caffeinate -dims`) for unattended paper recording.
 
 Note: `python3` (not `python`) on this machine. Live execution is intentionally NOT
 hardened yet (foundation round) — prove edge in paper first.
@@ -238,9 +264,11 @@ hardened yet (foundation round) — prove edge in paper first.
 
 ## Paper → Live Checklist
 
-- [ ] ≥ 300 windows of recorded `ticks` + resolved `outcomes`
-- [ ] **Model calibrated**: Brier score < 0.25 and a flat calibration table (`backtest.py`)
-- [ ] Profit factor ≥ 1.5 and positive EV/trade on the taker leg
+- [ ] ≥ 300 windows of recorded `ticks` + resolved `outcomes` **per asset**
+- [ ] **Model calibrated per asset**: Brier < 0.25 and a flat calibration table
+      (`backtest.py --asset BTC/ETH/SOL` — vol dynamics differ; don't assume BTC's
+      VOL_MULT transfers until each asset's table is flat)
+- [ ] Profit factor ≥ 1.5 and positive EV/trade on the taker leg (per asset)
 - [ ] Edge survives the real CEX→Chainlink basis (it is in the recorded data)
 - [ ] Both WebSocket reconnects tested (book re-subscribes, feeds recover)
 - [ ] Strike snapshot verified within REFERENCE_MAX_LAG of T=0 (no MISSED windows traded)

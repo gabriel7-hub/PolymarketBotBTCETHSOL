@@ -1,5 +1,6 @@
 """
-market_discovery.py — Resolve the active BTC Up/Down 5-minute window.
+market_discovery.py — Resolve the active Up/Down 5-minute window for one asset
+(BTC/ETH/SOL — one MarketDiscovery instance per asset).
 
 5-min markets are Gamma *events* with slug "<asset>-updown-5m-<start_unix_ts>",
 where start_ts is always a unix multiple of 300. So instead of scanning the API we
@@ -34,7 +35,8 @@ class MarketWindow:
     down_token_id:   str
     start_ts:        float          # UNIX timestamp of window open (from slug)
     end_ts:          float          # UNIX timestamp of window close
-    reference_price: float = 0.0    # BTC strike — snapshotted by the bot at start_ts
+    asset:           str = "BTC"    # which Up/Down market this window belongs to
+    reference_price: float = 0.0    # asset strike — snapshotted by the bot at start_ts
     tick_size:       str = "0.01"
     neg_risk:        bool = False
     slug:            str = ""
@@ -68,17 +70,19 @@ def current_window_start(now: Optional[float] = None) -> int:
     return int(now // config.MARKET_WINDOW_SECS) * config.MARKET_WINDOW_SECS
 
 
-def window_slug(start_ts: int) -> str:
-    return f"{config.MARKET_SLUG_PREFIX}{start_ts}"
+def window_slug(start_ts: int, asset: str = "BTC") -> str:
+    return f"{config.ASSET_PARAMS[asset]['slug_prefix']}{start_ts}"
 
 
 class MarketDiscovery:
     """
     Resolves the active window deterministically from the clock and fetches it by slug.
-    Thread-safe: other modules call .current to get the latest window.
+    One instance per asset. Thread-safe: other modules call .current for the latest window.
     """
 
-    def __init__(self):
+    def __init__(self, asset: str = "BTC"):
+        self.asset = asset
+        self._title_pattern = config.ASSET_PARAMS[asset]["title_pattern"]
         self._current: Optional[MarketWindow] = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -90,9 +94,10 @@ class MarketDiscovery:
             return self._current
 
     def start(self):
-        t = threading.Thread(target=self._poll_loop, daemon=True, name="market-discovery")
+        t = threading.Thread(target=self._poll_loop, daemon=True,
+                             name=f"discovery-{self.asset.lower()}")
         t.start()
-        logger.info("MarketDiscovery started")
+        logger.info(f"MarketDiscovery[{self.asset}] started")
 
     def stop(self):
         self._stop.set()
@@ -108,7 +113,7 @@ class MarketDiscovery:
                         f"Active: {window.market_title} | T-{window.time_remaining:.0f}s"
                     )
                 else:
-                    logger.debug("No active BTC 5-min window found")
+                    logger.debug(f"No active {self.asset} 5-min window found")
             except Exception as exc:
                 logger.warning(f"MarketDiscovery poll error: {exc}")
             # Poll briefly so we catch each new window right at its boundary.
@@ -117,7 +122,7 @@ class MarketDiscovery:
     @retry(max_attempts=3, base_delay=2.0)
     def fetch_window(self, start_ts: int) -> Optional[MarketWindow]:
         """Fetch and parse the event for the window starting at start_ts."""
-        ev = self._fetch_event(window_slug(start_ts))
+        ev = self._fetch_event(window_slug(start_ts, self.asset))
         if not ev:
             return None
         return self._parse_event(ev, start_ts)
@@ -127,7 +132,7 @@ class MarketDiscovery:
         Return the winning side ('UP'/'DOWN') for a window once resolved, else None.
         Reads the real Polymarket resolution (outcomePrices), NOT a price proxy.
         """
-        ev = self._fetch_event(window_slug(start_ts))
+        ev = self._fetch_event(window_slug(start_ts, self.asset))
         if not ev:
             return None
         mkt = self._first_market(ev)
@@ -209,8 +214,8 @@ class MarketDiscovery:
     def _parse_event(self, ev: dict, start_ts: int) -> Optional[MarketWindow]:
         try:
             title = ev.get("title", "") or ""
-            if config.MARKET_TITLE_PATTERN not in title:
-                logger.debug(f"Event title mismatch: {title!r}")
+            if self._title_pattern not in title:
+                logger.debug(f"[{self.asset}] Event title mismatch: {title!r}")
                 return None
             mkt = self._first_market(ev)
             if not mkt:
@@ -249,6 +254,7 @@ class MarketDiscovery:
                 down_token_id=str(down_token_id),
                 start_ts=float(start_ts),
                 end_ts=float(start_ts) + config.MARKET_WINDOW_SECS,
+                asset=self.asset,
                 tick_size=str(mkt.get("orderPriceMinTickSize") or config.TICK_SIZE),
                 neg_risk=bool(mkt.get("negRisk", False)),
                 slug=ev.get("slug", ""),

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>POLYDESK · BTC 5M</title>
+<title>POLYDESK · CRYPTO 5M</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
 
@@ -53,6 +53,19 @@ header{
 .led.on i{background:var(--up);box-shadow:0 0 8px var(--up)}
 .led.off i{background:var(--down);box-shadow:0 0 8px var(--down)}
 .clock{font-family:var(--mono);font-size:12px;color:var(--ink-2)}
+
+/* asset tabs */
+.tabs{display:flex;gap:6px}
+.tab{display:flex;flex-direction:column;align-items:center;gap:1px;min-width:74px;
+  padding:5px 12px;border:1px solid var(--line-2);border-radius:3px;background:var(--panel-2);
+  cursor:pointer;user-select:none;transition:.2s;position:relative}
+.tab:hover{border-color:var(--ink-3)}
+.tab.sel{border-color:var(--up);background:rgba(25,230,168,.07)}
+.tab .sym{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:.1em}
+.tab .pnl{font-family:var(--mono);font-size:10px;font-weight:600}
+.tab .posdot{position:absolute;top:4px;right:5px;width:6px;height:6px;border-radius:50%;
+  background:var(--warn);box-shadow:0 0 6px var(--warn);display:none}
+.tab.haspos .posdot{display:block}
 
 /* panels */
 .col{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--line)}
@@ -171,7 +184,8 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
 <div class="app">
 
   <header>
-    <div class="brand">POLY<b>DESK</b><span class="tag">BTC · 5MIN</span></div>
+    <div class="brand">POLY<b>DESK</b><span class="tag">CRYPTO · 5MIN</span></div>
+    <div class="tabs" id="tabs"></div>
     <div class="hstat"><span class="k">Mode</span><span id="h-mode" class="pill paper">PAPER</span></div>
     <div class="hstat"><span class="k">Session P&amp;L</span><span id="h-pnl" class="v num muted">—</span></div>
     <div class="hstat"><span class="k">Overall P&amp;L</span><span id="h-opnl" class="v num muted">—</span></div>
@@ -191,7 +205,7 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
     <!-- LEFT -->
     <div class="col">
       <div class="pane">
-        <div class="cap">Live BTC Price <span class="chip" id="basis-chip">basis —</span></div>
+        <div class="cap"><span id="px-cap">Live Price</span> <span class="chip" id="basis-chip">basis —</span></div>
         <div id="oracle-price" class="bigprice muted">—</div>
         <div class="subprices" style="grid-template-columns:repeat(3,1fr)">
           <div class="sp"><div class="k">Chainlink*</div><div id="px-chainlink" class="v">—</div></div>
@@ -299,7 +313,7 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
         <div class="row"><span class="k">Reward rate</span><span id="farm-rate" class="v num up">—</span></div>
       </div>
       <div class="pane">
-        <div class="cap">Session</div>
+        <div class="cap" id="s-cap">Asset Session</div>
         <div class="sgrid" style="margin-bottom:12px">
           <div class="stat"><div class="k">Net P&amp;L</div><div id="s-pnl" class="v muted">$0.00</div></div>
           <div class="stat"><div class="k">Win Rate</div><div id="s-wr" class="v muted">—</div></div>
@@ -319,10 +333,10 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
     <div class="trade-wrap">
       <table>
         <thead><tr>
-          <th>Time</th><th>Window</th><th>Side</th><th>Type</th><th>Entry</th>
+          <th>Time</th><th>Asset</th><th>Window</th><th>Side</th><th>Type</th><th>Entry</th>
           <th>Outcome</th><th>P&amp;L</th><th>Rebate</th>
         </tr></thead>
-        <tbody id="tbody"><tr><td colspan="8" class="muted" style="text-align:center;padding:18px">No trades yet</td></tr></tbody>
+        <tbody id="tbody"><tr><td colspan="9" class="muted" style="text-align:center;padding:18px">No trades yet</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -336,8 +350,30 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
 const WS_URL=(location.host?'ws://'+location.host:'ws://localhost:8000')+'/ws';
 const RING_LEN=2*Math.PI*76;            // 477.5
 const EV_MAX=0.10, ARB_MAX=0.06;        // meter full-scale
-const EV_THR=0.015, ARB_THR=0.005;      // config thresholds
+const EV_THR=0.03, ARB_THR=0.005;       // config thresholds (MIN_EV_TAKER / MIN_ARB_EDGE)
 let ws=null, reTimer=null, last=0, prev={};
+let sel=localStorage.getItem('polydesk-asset')||'BTC';   // selected asset tab
+let lastData=null;
+
+function renderTabs(d){
+  const names=(d.bot&&d.bot.assets)||Object.keys(d.assets||{});
+  if(!names.length)return;
+  if(!names.includes(sel))sel=names[0];
+  const el=$('tabs');
+  el.innerHTML=names.map(a=>{
+    const w=(d.assets||{})[a]||{},day=w.day||{};
+    const pnl=day.net_pnl!=null?day.net_pnl:0;
+    const cls='tab'+(a===sel?' sel':'')+(w.position?' haspos':'');
+    return `<div class="${cls}" data-a="${a}"><span class="posdot"></span>`+
+      `<span class="sym">${a}</span>`+
+      `<span class="pnl ${pnl>0?'up':pnl<0?'down':'muted'}">${(pnl>=0?'+':'−')+'$'+Math.abs(pnl).toFixed(2)}</span></div>`;
+  }).join('');
+  el.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+    sel=t.dataset.a;localStorage.setItem('polydesk-asset',sel);
+    prev={};                          // full repaint, no stale flash
+    if(lastData)render(lastData);
+  });
+}
 
 function connect(){
   if(ws&&ws.readyState<2)return;
@@ -353,7 +389,13 @@ function set(id,t,cls){const e=$(id);if(!e)return;if(e.textContent!==t){e.textCo
 function flash(e){e.classList.remove('flash');void e.offsetWidth;e.classList.add('flash')}
 
 function render(d){
-  const bot=d.bot||{},mk=d.market||{},btc=d.btc||{},bk=d.book||{},sg=d.signal||{},st=d.strategy||{},pos=d.position,tr=d.ledger||d.recent_trades||[];
+  lastData=d;
+  renderTabs(d);
+  // All per-asset blocks come from the selected asset's worker snapshot.
+  const a=(d.assets||{})[sel]||{};
+  const bot=d.bot||{},mk=a.market||{},btc=a.px||{},bk=a.book||{},sg=a.signal||{},
+        st=a.strategy||{},pos=a.position,day=a.day||{},tr=d.ledger||d.recent_trades||[];
+  set('px-cap','Live '+(a.name||sel)+' Price','');
 
   // header
   const stat=(bot.status||'PAPER'),sl=stat.toLowerCase();
@@ -437,11 +479,12 @@ function render(d){
   set('farm-size',st.farm_size?'$'+f(st.farm_size,0):'—','v num '+(st.farm_size?'':'muted'));
   set('farm-rate',st.farm_reward_per_sec?'+$'+(st.farm_reward_per_sec*300).toFixed(4)+'/win':'—','v num up');
 
-  // session
-  set('s-pnl',money(bot.daily_pnl),'v num '+pnlc(bot.daily_pnl));
-  set('s-wr',bot.win_rate!=null?pct(bot.win_rate):'—','v num '+(bot.win_rate>=.5?'up':bot.win_rate!=null?'down':'muted'));
-  set('s-trades',String(bot.daily_trades||0),'v num');
-  set('s-reward',bot.rebates_today!=null?'+$'+f(bot.rebates_today,3):'$0.000','v num up');
+  // per-asset session (today, this asset only — header shows the global totals)
+  set('s-cap',sel+' Session — Today','cap');
+  set('s-pnl',money(day.net_pnl),'v num '+pnlc(day.net_pnl));
+  set('s-wr',day.win_rate!=null?pct(day.win_rate):'—','v num '+(day.win_rate>=.5?'up':day.win_rate!=null?'down':'muted'));
+  set('s-trades',String(day.trades||0),'v num');
+  set('s-reward',st.farm_reward_session!=null?'+$'+f(st.farm_reward_session,3):'$0.000','v num up');
 
   renderPos(pos); renderTrades(tr);
   prev._init=true;
@@ -485,8 +528,9 @@ function renderPos(p){
 }
 function renderTrades(rows){
   const tb=$('tbody');
-  if(!rows||!rows.length){tb.innerHTML='<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">No trades yet</td></tr>';return}
+  if(!rows||!rows.length){tb.innerHTML='<tr><td colspan="9" class="muted" style="text-align:center;padding:18px">No trades yet</td></tr>';return}
   tb.innerHTML=rows.map(t=>{
+    const asset=t.asset||'BTC';
     const leg=t.leg||t.order_type||'—';                 // FARM | ARB | TAKER
     const legc=leg==='FARM'?'farm':leg==='ARB'?'arb':'muted';
     const outcome=t.outcome||t.status||'—';
@@ -501,6 +545,7 @@ function renderTrades(rows){
     const dp=(pnl!==0&&Math.abs(pnl)<0.01)?4:2;          // show tiny farm rewards
     return `<tr>
       <td class="muted">${when}</td>
+      <td class="dim">${asset}</td>
       <td>${win}</td>
       <td class="${sc}">${side}</td>
       <td class="${legc}">${leg}</td>

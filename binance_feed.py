@@ -1,5 +1,6 @@
 """
-binance_feed.py — Real-time BTC/USDT price feed from Binance aggTrade WebSocket.
+binance_feed.py — Real-time <asset>/USDT price feed from Binance aggTrade WebSocket.
+One instance per asset (BTC/ETH/SOL), each on its own socket.
 
 Maintains:
   - current_price     : most recent trade price
@@ -22,7 +23,10 @@ from utils import bp, realized_vol_per_sec as _rv
 
 class BinanceFeed:
 
-    def __init__(self):
+    def __init__(self, asset: str = "BTC"):
+        self.asset = asset
+        self._symbol = config.ASSET_PARAMS[asset]["binance_symbol"]
+        self._url = f"{config.BINANCE_WS_BASE}/{self._symbol}@aggTrade"
         self.current_price: float = 0.0
         self.connected: bool = False
 
@@ -36,9 +40,10 @@ class BinanceFeed:
     # ─── Public API ────────────────────────────────────────────────────────────
 
     def start(self):
-        t = threading.Thread(target=self._run_loop, daemon=True, name="binance-feed")
+        t = threading.Thread(target=self._run_loop, daemon=True,
+                             name=f"binance-{self.asset.lower()}")
         t.start()
-        logger.info("BinanceFeed started")
+        logger.info(f"BinanceFeed[{self.asset}] started ({self._symbol})")
 
     def stop(self):
         self._stop.set()
@@ -91,7 +96,8 @@ class BinanceFeed:
         while not self._stop.is_set():
             self._connect()
             if not self._stop.is_set():
-                logger.warning(f"BinanceFeed disconnected. Reconnecting in {self._reconnect_delay}s")
+                logger.warning(f"BinanceFeed[{self.asset}] disconnected. "
+                               f"Reconnecting in {self._reconnect_delay}s")
                 self._stop.wait(timeout=self._reconnect_delay)
                 self._reconnect_delay = min(
                     self._reconnect_delay * 2, config.RECONNECT_MAX_DELAY
@@ -99,7 +105,7 @@ class BinanceFeed:
 
     def _connect(self):
         self._ws = websocket.WebSocketApp(
-            config.BINANCE_WS_URL,
+            self._url,
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
@@ -110,15 +116,15 @@ class BinanceFeed:
     def _on_open(self, ws):
         self.connected = True
         self._reconnect_delay = config.RECONNECT_BASE_DELAY
-        logger.info("BinanceFeed connected")
+        logger.info(f"BinanceFeed[{self.asset}] connected")
 
     def _on_close(self, ws, code, msg):
         self.connected = False
-        logger.info(f"BinanceFeed closed (code={code})")
+        logger.info(f"BinanceFeed[{self.asset}] closed (code={code})")
 
     def _on_error(self, ws, error):
         self.connected = False
-        logger.warning(f"BinanceFeed error: {error}")
+        logger.warning(f"BinanceFeed[{self.asset}] error: {error}")
 
     def _on_message(self, ws, raw: str):
         try:

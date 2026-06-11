@@ -9,9 +9,12 @@ import state
 
 
 class RiskGuard:
+    """One instance per asset: cooldown/consecutive-loss state and the open-position
+    guard are per asset; the daily-loss halt reads the GLOBAL daily P&L (one bankroll)."""
 
-    def __init__(self, paper_mode: bool = True):
+    def __init__(self, paper_mode: bool = True, asset: str = "BTC"):
         self.paper_mode = paper_mode
+        self.asset = asset
         self._consecutive_losses = 0
         self._cooldown_remaining = 0     # windows to skip after a loss
         self._session_start_pnl = state.get_daily_pnl()
@@ -38,8 +41,8 @@ class RiskGuard:
         if config.MAX_CONSECUTIVE_LOSSES > 0 and self._consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
             return False, f"CONSEC_LOSS_HALT: {self._consecutive_losses} consecutive losses"
 
-        # 4. Already have an open position
-        open_pos = state.get_open_position()
+        # 4. Already have an open position on THIS asset
+        open_pos = state.get_open_position(self.asset)
         if open_pos:
             return False, "OPEN_POSITION: waiting for current position to resolve"
 
@@ -51,7 +54,7 @@ class RiskGuard:
     def on_loss(self):
         self._consecutive_losses += 1
         self._cooldown_remaining = config.POST_LOSS_COOLDOWN
-        msg = f"Loss recorded. Consecutive losses: {self._consecutive_losses}."
+        msg = f"[{self.asset}] Loss recorded. Consecutive losses: {self._consecutive_losses}."
         if config.POST_LOSS_COOLDOWN > 0:
             msg += f" Cooling down for {config.POST_LOSS_COOLDOWN} windows."
         logger.warning(msg)

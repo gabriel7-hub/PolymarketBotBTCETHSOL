@@ -107,9 +107,11 @@ class PolymarketBook:
     Manages a WebSocket connection to Polymarket's CLOB.
     Subscribes to the active market's Up and Down token books.
     Re-subscribes automatically when the market changes.
+    One instance (one socket) per asset.
     """
 
-    def __init__(self):
+    def __init__(self, asset: str = "BTC"):
+        self.asset = asset
         self.up_book   = TokenBook()
         self.down_book = TokenBook()
         self.connected = False
@@ -125,9 +127,10 @@ class PolymarketBook:
     # ─── Public API ────────────────────────────────────────────────────────────
 
     def start(self):
-        t = threading.Thread(target=self._run_loop, daemon=True, name="poly-book")
+        t = threading.Thread(target=self._run_loop, daemon=True,
+                             name=f"poly-book-{self.asset.lower()}")
         t.start()
-        logger.info("PolymarketBook started")
+        logger.info(f"PolymarketBook[{self.asset}] started")
 
     def stop(self):
         self._stop.set()
@@ -188,7 +191,8 @@ class PolymarketBook:
         while not self._stop.is_set():
             self._connect()
             if not self._stop.is_set():
-                logger.warning(f"PolymarketBook disconnected. Reconnecting in {self._reconnect_delay}s")
+                logger.warning(f"PolymarketBook[{self.asset}] disconnected. "
+                               f"Reconnecting in {self._reconnect_delay}s")
                 self.connected = False
                 self._stop.wait(timeout=self._reconnect_delay)
                 self._reconnect_delay = min(
@@ -208,7 +212,7 @@ class PolymarketBook:
     def _on_open(self, ws):
         self.connected = True
         self._reconnect_delay = config.RECONNECT_BASE_DELAY
-        logger.info("PolymarketBook connected")
+        logger.info(f"PolymarketBook[{self.asset}] connected")
         # Re-subscribe to the active market after any (re)connect, else the book
         # silently stays empty until the next market change.
         if self._up_token_id and self._down_token_id:
@@ -217,17 +221,17 @@ class PolymarketBook:
             self._send_subscription(self._up_token_id, self._down_token_id)
         # Start heartbeat thread
         self._ping_thread = threading.Thread(
-            target=self._heartbeat, daemon=True, name="poly-ping"
+            target=self._heartbeat, daemon=True, name=f"poly-ping-{self.asset.lower()}"
         )
         self._ping_thread.start()
 
     def _on_close(self, ws, code, msg):
         self.connected = False
-        logger.info(f"PolymarketBook closed (code={code})")
+        logger.info(f"PolymarketBook[{self.asset}] closed (code={code})")
 
     def _on_error(self, ws, error):
         self.connected = False
-        logger.warning(f"PolymarketBook error: {error}")
+        logger.warning(f"PolymarketBook[{self.asset}] error: {error}")
 
     def _on_message(self, ws, raw: str):
         # Polymarket replies to our PING with a plain "PONG" string (not JSON).
@@ -289,9 +293,10 @@ class PolymarketBook:
         }
         try:
             self._ws.send(json.dumps(msg))
-            logger.info(f"PolymarketBook subscribed to {up_token_id[:12]}… / {down_token_id[:12]}…")
+            logger.info(f"PolymarketBook[{self.asset}] subscribed to "
+                        f"{up_token_id[:12]}… / {down_token_id[:12]}…")
         except Exception as exc:
-            logger.warning(f"Subscription send failed: {exc}")
+            logger.warning(f"PolymarketBook[{self.asset}] subscription send failed: {exc}")
 
     def _heartbeat(self):
         while self.connected and not self._stop.is_set():

@@ -30,9 +30,12 @@ from utils import bp, realized_vol_per_sec as _rv
 
 
 class CoinbaseFeed:
-    """Real-time BTC-USD price from Coinbase's `ticker` channel. Mirrors BinanceFeed."""
+    """Real-time <asset>-USD price from Coinbase's `ticker` channel. Mirrors BinanceFeed.
+    One instance per asset, each on its own socket."""
 
-    def __init__(self):
+    def __init__(self, asset: str = "BTC"):
+        self.asset = asset
+        self._product = config.ASSET_PARAMS[asset]["coinbase_product"]
         self.current_price: float = 0.0
         self.connected: bool = False
         self._history: deque = deque(maxlen=3600)
@@ -42,9 +45,10 @@ class CoinbaseFeed:
         self._reconnect_delay = config.RECONNECT_BASE_DELAY
 
     def start(self):
-        t = threading.Thread(target=self._run_loop, daemon=True, name="coinbase-feed")
+        t = threading.Thread(target=self._run_loop, daemon=True,
+                             name=f"coinbase-{self.asset.lower()}")
         t.start()
-        logger.info("CoinbaseFeed started")
+        logger.info(f"CoinbaseFeed[{self.asset}] started ({self._product})")
 
     def stop(self):
         self._stop.set()
@@ -74,7 +78,8 @@ class CoinbaseFeed:
             self._connect()
             if not self._stop.is_set():
                 self.connected = False
-                logger.warning(f"CoinbaseFeed disconnected. Reconnecting in {self._reconnect_delay}s")
+                logger.warning(f"CoinbaseFeed[{self.asset}] disconnected. "
+                               f"Reconnecting in {self._reconnect_delay}s")
                 self._stop.wait(timeout=self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, config.RECONNECT_MAX_DELAY)
 
@@ -93,22 +98,22 @@ class CoinbaseFeed:
         self._reconnect_delay = config.RECONNECT_BASE_DELAY
         sub = {
             "type": "subscribe",
-            "product_ids": [config.COINBASE_PRODUCT],
+            "product_ids": [self._product],
             "channels": ["ticker"],
         }
         try:
             ws.send(json.dumps(sub))
         except Exception as exc:
-            logger.warning(f"CoinbaseFeed subscribe failed: {exc}")
-        logger.info("CoinbaseFeed connected")
+            logger.warning(f"CoinbaseFeed[{self.asset}] subscribe failed: {exc}")
+        logger.info(f"CoinbaseFeed[{self.asset}] connected")
 
     def _on_close(self, ws, code, msg):
         self.connected = False
-        logger.info(f"CoinbaseFeed closed (code={code})")
+        logger.info(f"CoinbaseFeed[{self.asset}] closed (code={code})")
 
     def _on_error(self, ws, error):
         self.connected = False
-        logger.warning(f"CoinbaseFeed error: {error}")
+        logger.warning(f"CoinbaseFeed[{self.asset}] error: {error}")
 
     def _on_message(self, ws, raw: str):
         try:
@@ -125,12 +130,15 @@ class CoinbaseFeed:
 
 class ChainlinkFeed:
     """
-    The EXACT Chainlink BTC/USD data-stream price Polymarket uses to settle these markets,
-    via the Real-Time Data Socket (no auth). This is the "Price to Beat" source — using it
-    for the strike snapshot makes Strike(ref) equal Polymarket's published value exactly.
+    The EXACT Chainlink <asset>/USD data-stream price Polymarket uses to settle these
+    markets, via the Real-Time Data Socket (no auth). This is the "Price to Beat" source —
+    using it for the strike snapshot makes Strike(ref) equal Polymarket's published value
+    exactly. One instance (one socket) per asset.
     """
 
-    def __init__(self):
+    def __init__(self, asset: str = "BTC"):
+        self.asset = asset
+        self._symbol = config.ASSET_PARAMS[asset]["chainlink_symbol"]
         self.current_price: float = 0.0
         self.connected: bool = False
         self._last_ts: float = 0.0          # wall-clock of last real price update
@@ -141,8 +149,10 @@ class ChainlinkFeed:
         self._reconnect_delay = config.RECONNECT_BASE_DELAY
 
     def start(self):
-        threading.Thread(target=self._run_loop, daemon=True, name="chainlink-feed").start()
-        logger.info("ChainlinkFeed started (Polymarket RTDS settlement price)")
+        threading.Thread(target=self._run_loop, daemon=True,
+                         name=f"chainlink-{self.asset.lower()}").start()
+        logger.info(f"ChainlinkFeed[{self.asset}] started "
+                    f"(Polymarket RTDS settlement price, {self._symbol})")
 
     @property
     def fresh(self) -> bool:
@@ -173,7 +183,8 @@ class ChainlinkFeed:
             self._connect()
             if not self._stop.is_set():
                 self.connected = False
-                logger.warning(f"ChainlinkFeed disconnected. Reconnecting in {self._reconnect_delay}s")
+                logger.warning(f"ChainlinkFeed[{self.asset}] disconnected. "
+                               f"Reconnecting in {self._reconnect_delay}s")
                 self._stop.wait(timeout=self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, config.RECONNECT_MAX_DELAY)
 
@@ -193,20 +204,20 @@ class ChainlinkFeed:
         self._reconnect_delay = config.RECONNECT_BASE_DELAY
         sub = {"action": "subscribe", "subscriptions": [
             {"topic": "crypto_prices_chainlink", "type": "*",
-             "filters": json.dumps({"symbol": config.CHAINLINK_SYMBOL})}]}
+             "filters": json.dumps({"symbol": self._symbol})}]}
         try:
             ws.send(json.dumps(sub))
         except Exception as exc:
-            logger.warning(f"ChainlinkFeed subscribe failed: {exc}")
-        logger.info("ChainlinkFeed connected")
+            logger.warning(f"ChainlinkFeed[{self.asset}] subscribe failed: {exc}")
+        logger.info(f"ChainlinkFeed[{self.asset}] connected")
 
     def _on_close(self, ws, code, msg):
         self.connected = False
-        logger.info(f"ChainlinkFeed closed (code={code})")
+        logger.info(f"ChainlinkFeed[{self.asset}] closed (code={code})")
 
     def _on_error(self, ws, error):
         self.connected = False
-        logger.warning(f"ChainlinkFeed error: {error}")
+        logger.warning(f"ChainlinkFeed[{self.asset}] error: {error}")
 
     def _on_message(self, ws, raw: str):
         if not raw or raw[0] not in "[{":   # ignore empty/keepalive frames quietly
@@ -216,6 +227,11 @@ class ChainlinkFeed:
             if msg.get("topic") != "crypto_prices_chainlink":
                 return
             payload = msg.get("payload") or {}
+            # Defensive: only accept our own symbol in case the server-side filter
+            # is ignored and the socket streams every asset.
+            sym = payload.get("symbol")
+            if sym and str(sym).lower() != self._symbol:
+                return
             val = payload.get("value")
             if val is None:
                 return
@@ -240,12 +256,14 @@ class Oracle:
     diagnostic, and a fallback if the Chainlink socket drops.
     """
 
-    def __init__(self, binance, coinbase: Optional[CoinbaseFeed] = None,
+    def __init__(self, binance, asset: str = "BTC",
+                 coinbase: Optional[CoinbaseFeed] = None,
                  chainlink: Optional[ChainlinkFeed] = None,
                  coinbase_weight: float = 0.6):
+        self.asset = asset
         self._binance = binance
-        self._coinbase = coinbase or CoinbaseFeed()
-        self._chainlink = chainlink or ChainlinkFeed()
+        self._coinbase = coinbase or CoinbaseFeed(asset)
+        self._chainlink = chainlink or ChainlinkFeed(asset)
         self._w = coinbase_weight
 
     def start(self):

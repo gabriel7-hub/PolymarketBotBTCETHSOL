@@ -27,9 +27,11 @@ except ImportError:
 
 
 class Executor:
+    """One instance per asset (tracks that asset's active order/position only)."""
 
-    def __init__(self, paper_mode: bool = True):
+    def __init__(self, paper_mode: bool = True, asset: str = "BTC"):
         self.paper_mode = paper_mode
+        self.asset = asset
         self._client: Optional[object] = None
         self._active_order_id: Optional[str] = None
         self._active_pos_id: Optional[int] = None
@@ -78,6 +80,7 @@ class Executor:
         if self.paper_mode:
             state.add_arb_pnl(profit)
             state.record_trade({
+                "asset": self.asset,
                 "market_id": window.condition_id, "start_ts": int(window.start_ts),
                 "leg": "ARB", "side": "PAIR", "price": round(cost_per_pair, 4),
                 "detail": f"UP@{up_ask:.2f}+DOWN@{down_ask:.2f}", "size_usdc": signal.farm_size,
@@ -85,7 +88,7 @@ class Executor:
                 "closed_at": time.time(),
             })
             logger.info(
-                f"[PAPER][ARB] buy UP@{up_ask:.2f}+DOWN@{down_ask:.2f}="
+                f"[PAPER][ARB][{self.asset}] buy UP@{up_ask:.2f}+DOWN@{down_ask:.2f}="
                 f"{cost_per_pair:.3f} | {pairs:.0f} pairs | locked +${profit:.2f}"
             )
             return True
@@ -106,7 +109,7 @@ class Executor:
                 detail = f"UP@{signal.farm_up_px} / DOWN@{signal.farm_down_px}"
                 state.record_farm_accrual(
                     int(window.start_ts), window.condition_id, "TWO-SIDED",
-                    detail, signal.farm_size, accrued,
+                    detail, signal.farm_size, accrued, asset=self.asset,
                 )
             return accrued
         logger.warning("Live FARM execution not implemented this round")
@@ -149,6 +152,7 @@ class Executor:
         state.close_position(pos["id"], opp_ask, round(pnl, 4), 0.0, "BOXED")
         state.resolve_taker_ledger(pos["market_id"], "BOXED", round(pnl, 4))
         state.record_trade({
+            "asset": self.asset,
             "market_id": pos["market_id"], "start_ts": int(window.start_ts),
             "leg": "BOX", "side": opp_side, "price": opp_ask,
             "detail": f"box {side}@{entry:.3f} + {opp_side}@{opp_ask:.3f} "
@@ -157,8 +161,8 @@ class Executor:
             "status": "RESOLVED", "outcome": "BOXED", "closed_at": time.time(),
         })
         logger.info(
-            f"[{'PAPER' if self.paper_mode else 'LIVE'}][BOX] {side}@{entry:.3f} hedged with "
-            f"{opp_side}@{opp_ask:.3f} | locked pnl={pnl:+.2f}"
+            f"[{'PAPER' if self.paper_mode else 'LIVE'}][BOX][{self.asset}] {side}@{entry:.3f} "
+            f"hedged with {opp_side}@{opp_ask:.3f} | locked pnl={pnl:+.2f}"
         )
         self._active_order_id   = None
         self._active_pos_id     = None
@@ -168,6 +172,7 @@ class Executor:
     def _ledger_open_taker(self, window, side, price, size_usdc) -> int:
         """Append a TAKER fill to the audit ledger (OPEN until the window resolves)."""
         return state.record_trade({
+            "asset": self.asset,
             "market_id": window.condition_id, "start_ts": int(window.start_ts),
             "leg": "TAKER", "side": side, "price": price,
             "detail": f"{side}@{price:.3f}", "size_usdc": size_usdc,
@@ -202,9 +207,9 @@ class Executor:
         """
         Called when a window closes and we know the outcome.
         winning_side: 'UP' or 'DOWN'
-        Resolves the open position and records P&L.
+        Resolves this asset's open position and records P&L.
         """
-        pos = state.get_open_position()
+        pos = state.get_open_position(self.asset)
         if not pos:
             return
 
@@ -234,7 +239,7 @@ class Executor:
         state.close_position(pos_id, 1.0 if won else 0.0, pnl, rebate, outcome)
         state.resolve_taker_ledger(pos["market_id"], outcome, pnl)   # sync dashboard history
         logger.info(
-            f"Resolved: {side} side {outcome} | "
+            f"Resolved [{self.asset}]: {side} side {outcome} | "
             f"entry={entry_price:.3f} pnl={pnl:+.2f} rebate={rebate:.3f}"
         )
 
@@ -246,8 +251,9 @@ class Executor:
 
     def _paper_execute(self, signal: Signal, window: MarketWindow, side: str,
                        price: float, size_usdc: float, order_type: str) -> bool:
-        order_id = f"PAPER-{int(signal.ts * 1000)}"
+        order_id = f"PAPER-{self.asset}-{int(signal.ts * 1000)}"
         pos_id = state.open_position({
+            "asset":        self.asset,
             "market_id":    window.condition_id,
             "market_title": window.market_title,
             "side":         side,
@@ -262,7 +268,7 @@ class Executor:
         self._active_order_type = order_type
         self._active_trade_id = self._ledger_open_taker(window, side, price, size_usdc)
         logger.info(
-            f"[PAPER] {order_type} {side} @ {price:.3f} | "
+            f"[PAPER][{self.asset}] {order_type} {side} @ {price:.3f} | "
             f"size=${size_usdc} | P(side)={signal.p_up if side=='UP' else signal.p_down:.3f}"
         )
         return True
@@ -288,6 +294,7 @@ class Executor:
             )
             order_id = resp.get("orderID") or resp.get("id") or ""
             pos_id = state.open_position({
+                "asset":        self.asset,
                 "market_id":    window.condition_id,
                 "market_title": window.market_title,
                 "side":         side,
@@ -302,7 +309,7 @@ class Executor:
             self._active_order_type = order_type
             self._active_trade_id = self._ledger_open_taker(window, side, price, size_usdc)
             logger.info(
-                f"[LIVE] {order_type} {side} @ {price:.3f} | "
+                f"[LIVE][{self.asset}] {order_type} {side} @ {price:.3f} | "
                 f"size=${size_usdc} | order_id={order_id}"
             )
             return True
