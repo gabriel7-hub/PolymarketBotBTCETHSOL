@@ -260,6 +260,34 @@ machine awake (`caffeinate -dims`) for unattended paper recording.
 Note: `python3` (not `python`) on this machine. Live execution is intentionally NOT
 hardened yet (foundation round) — prove edge in paper first.
 
+### Unattended VPS run (the supported way to record a clean week)
+
+```bash
+tmux new -s polybot './run.sh'          # supervisor: auto-restarts on crash/OOM
+#   …or install the systemd unit:
+sudo cp polybot.service /etc/systemd/system/ && sudo systemctl enable --now polybot
+ssh -L 8000:localhost:8000 user@vps     # view the dashboard privately (host stays 127.0.0.1)
+# Hourly SAFE snapshot (never `cp` a live WAL DB — that corrupts the copy):
+(crontab -l; echo "0 * * * * cd ~/PolymarketBot && python3 backup_db.py --keep 48") | crontab -
+```
+
+The bot now **quarantines a corrupt `bot_state.db` on startup** (renames it
+`*.corrupt.<ts>` and starts fresh) and runs an **hourly prune + WAL checkpoint** so a
+multi-day session stays bounded and crash-safe (`synchronous=NORMAL` + WAL).
+
+### Paper-fill realism (`config.PAPER_FILL_REALISM`, default ON)
+
+Paper taker/box fills now walk the **real displayed ask depth (VWAP)** + one adverse tick
+of latency slippage, instead of assuming the full stake fills at the touch. A box that
+can't fully hedge within `BOX_MAX_FILL_SLIPPAGE` of the touch is **skipped** (the position
+rides to resolution) — so the recorded box P&L is one we could actually capture. Set
+`PAPER_FILL_REALISM=False` to reproduce the old optimistic ledger for comparison.
+
+> **Open question this week answers:** the recorded directional taker leg is net-negative
+> on all three assets (BTC −$823 / ETH −$250 / SOL −$705 on raw WIN−LOSS); the hedge-to-box
+> exit is what makes the system positive. Re-run `backtest.py --validate --asset …` after a
+> few days of realistic-fill data to confirm the box edge survives real liquidity.
+
 ---
 
 ## Paper → Live Checklist

@@ -103,6 +103,20 @@ BOX_STOP_MARGIN_PROFIT = 0.20
 MAX_SPREAD           = 0.06    # skip if order book spread is wider than this
 MAX_SLIPPAGE         = 0.02    # 2¢: cancel if ask moves more than this before fill
 
+# ─── Paper-fill realism (conservative; makes paper P&L a believable lower bound) ──
+# The old paper model filled every IOC taker AND every hedge-to-box at the displayed
+# best ask, full size, instantly. That is optimistic — especially the box, which locks
+# profit by buying the cheap (~3¢) tail where the book is thinnest. With this enabled,
+# paper fills walk the REAL displayed ask depth (VWAP) and pay an extra adverse tick for
+# the 1s snapshot→order latency, so the recorded edge is one we could actually capture.
+# Set False to restore the old optimistic behaviour (e.g. to A/B against prior data).
+PAPER_FILL_REALISM   = True
+PAPER_SLIPPAGE_TICKS = 1       # extra adverse ticks (×TICK_SIZE) applied to every paper fill
+BOX_MAX_FILL_SLIPPAGE = 0.02   # if hedging the full box costs more than opp_ask + this (VWAP
+                               # slippage through thin depth), DON'T box — let the position ride
+                               # to natural resolution. Tests whether the box edge survives real
+                               # liquidity instead of assuming a free lock at the touch.
+
 # ─── Strategy Timing ───────────────────────────────────────────────────────────
 # Taker fires only in the mid-window zone where 1s loop latency is tolerable.
 # Last-second sniping is intentionally NOT attempted — we cannot win that latency race.
@@ -217,6 +231,9 @@ STATE_PUSH_INTERVAL  = 1.0     # seconds between dashboard WebSocket pushes
 
 # ─── Data retention (bound DB growth on a long-running host) ────────────────────
 TICK_RETENTION_DAYS  = int(os.getenv("TICK_RETENTION_DAYS", "14"))   # 0 = keep forever
+# How often the runner prunes old ticks + truncates the WAL during a long session
+# (prune used to run only at startup, so a week-long run never reclaimed space).
+MAINTENANCE_INTERVAL_SECS = int(os.getenv("MAINTENANCE_INTERVAL_SECS", "3600"))
 
 # ─── SQLite Database ───────────────────────────────────────────────────────────
 DB_PATH              = "bot_state.db"

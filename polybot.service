@@ -1,0 +1,28 @@
+# polybot.service — systemd unit for unattended paper recording on a Linux VPS.
+#
+# Install:
+#   sudo cp polybot.service /etc/systemd/system/polybot.service
+#   # edit User=, WorkingDirectory=, and ExecStart= paths below to match the deploy
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now polybot
+#   journalctl -u polybot -f          # follow logs
+#
+# Restart=always covers crashes/OOM (run.sh is for tmux/manual use; pick ONE).
+
+[Unit]
+Description=Polymarket 5-min paper-trading bot (BTC/ETH/SOL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polybot
+WorkingDirectory=/home/polybot/PolymarketBot
+ExecStart=/usr/bin/python3 main.py --mode paper
+Restart=always
+RestartSec=5
+# Keep the dashboard private (loopback). Tunnel it: ssh -L 8000:localhost:8000 user@vps
+Environment=DASHBOARD_HOST=127.0.0.1
+
+[Install]
+WantedBy=multi-user.target

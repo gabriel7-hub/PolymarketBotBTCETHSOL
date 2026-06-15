@@ -19,7 +19,58 @@ def _conn() -> sqlite3.Connection:
     # Three asset workers write concurrently; without a busy timeout a writer that
     # collides with another thread's transaction raises SQLITE_BUSY immediately.
     conn.execute("PRAGMA busy_timeout=5000")
+    # synchronous=NORMAL is the documented-safe pairing for WAL (no corruption on app
+    # crash; only a power-loss can lose the last committed txn) and is markedly faster
+    # than the FULL default for our ~3 writes/sec tick load. wal_autocheckpoint keeps the
+    # -wal file from growing unbounded between the explicit TRUNCATE checkpoints below.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
     return conn
+
+
+def checkpoint() -> None:
+    """Fold the WAL back into the main DB and truncate it. Called periodically by the
+    runner so a week-long session can't accumulate a giant -wal file (and so a clean
+    snapshot/backup sees an up-to-date main file)."""
+    try:
+        with _conn() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as exc:
+        logger.warning(f"WAL checkpoint failed: {exc}")
+
+
+def integrity_ok(path: Optional[str] = None) -> bool:
+    """Return True iff the database passes PRAGMA quick_check. Used at startup to refuse
+    to run on a malformed file (which would silently drop writes / crash mid-week)."""
+    path = config.DB_PATH if path is None else path
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            return bool(row) and row[0] == "ok"
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.error(f"Integrity check could not run on {path}: {exc}")
+        return False
+
+
+def backup(dest: str) -> bool:
+    """Make a consistent snapshot of the live DB using SQLite's online-backup API.
+    Safe to call while the bot is running, unlike `cp` of a WAL-mode file (that is what
+    corrupted the supplied 616 MB copy). Returns True on success."""
+    try:
+        src = _conn()
+        dst = sqlite3.connect(dest)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        return True
+    except sqlite3.Error as exc:
+        logger.error(f"Backup to {dest} failed: {exc}")
+        return False
 
 
 def init_db():

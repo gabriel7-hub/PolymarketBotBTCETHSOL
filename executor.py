@@ -26,6 +26,15 @@ except ImportError:
     _CLIENT_AVAILABLE = False
 
 
+def _tick(tick_size) -> float:
+    """Parse a window's tick size (a string like '0.01') into a float, default 0.01."""
+    try:
+        t = float(tick_size)
+        return t if t > 0 else 0.01
+    except (TypeError, ValueError):
+        return 0.01
+
+
 class Executor:
     """One instance per asset (tracks that asset's active order/position only)."""
 
@@ -43,10 +52,12 @@ class Executor:
 
     # ─── Public API ────────────────────────────────────────────────────────────
 
-    def execute(self, signal: Signal, window: MarketWindow) -> bool:
+    def execute(self, signal: Signal, window: MarketWindow, book=None) -> bool:
         """
         Execute the signal if it calls for a trade.
         Returns True if an order was placed/simulated.
+        `book` (the live PolymarketBook) enables depth-aware paper fills; optional so
+        callers/tests without a book fall back to the optimistic best-ask fill.
         """
         if signal.action not in (
             Action.POST_MAKER_UP, Action.POST_MAKER_DOWN,
@@ -61,7 +72,8 @@ class Executor:
         token_id  = window.up_token_id if side == "UP" else window.down_token_id
 
         if self.paper_mode:
-            return self._paper_execute(signal, window, side, price, size_usdc, order_type)
+            return self._paper_execute(signal, window, side, price, size_usdc,
+                                       order_type, book)
         else:
             return self._live_execute(signal, window, side, price, size_usdc,
                                       order_type, token_id)
@@ -115,24 +127,46 @@ class Executor:
         logger.warning("Live FARM execution not implemented this round")
         return 0.0
 
-    def box_position(self, window: MarketWindow, pos: dict, opp_ask: float) -> Optional[float]:
+    def box_position(self, window: MarketWindow, pos: dict, opp_ask: float,
+                     book=None) -> Optional[float]:
         """
         Hedge-to-box stop-loss: buy the OPPOSITE side of the open taker position, share
         for share, so the pair redeems a guaranteed $1 regardless of outcome. Locks a
         small defined loss (occasionally a gain) instead of riding a flipped signal to a
-        full-stake loss. Returns the locked P&L, or None if the order failed.
+        full-stake loss. Returns the locked P&L, or None if the box did NOT execute
+        (order failed, or — under fill realism — the opposite book can't absorb the full
+        hedge cheaply enough, in which case the position rides to natural resolution).
         """
         side      = pos["side"]
         opp_side  = "DOWN" if side == "UP" else "UP"
         entry     = pos["entry_price"]
         size_usdc = pos["size_usdc"]
         shares    = size_usdc / entry
-        hedge_usdc = shares * opp_ask
+
+        # ── Conservative fill realism: price the hedge against the REAL opposite-ask
+        # depth (VWAP) + a latency tick. The box locks profit by lifting the cheap tail,
+        # exactly where depth is thinnest — so if we can't fill the full hedge within
+        # BOX_MAX_FILL_SLIPPAGE of the touch, we DON'T box and let the position ride.
+        hedge_px = opp_ask
+        if config.PAPER_FILL_REALISM and book is not None and self.paper_mode:
+            tick = _tick(getattr(window, "tick_size", "0.01"))
+            filled_shares, vwap = book.fill_ask(opp_side, shares)
+            if filled_shares + 1e-6 < shares:
+                logger.info(f"[PAPER][BOX][{self.asset}] skip — {opp_side} depth only "
+                            f"{filled_shares:.1f}/{shares:.1f}sh; position rides to resolution")
+                return None
+            hedge_px = min(0.99, vwap + config.PAPER_SLIPPAGE_TICKS * tick)
+            if hedge_px > opp_ask + config.BOX_MAX_FILL_SLIPPAGE:
+                logger.info(f"[PAPER][BOX][{self.asset}] skip — hedge VWAP {hedge_px:.3f} > "
+                            f"ask {opp_ask:.3f}+{config.BOX_MAX_FILL_SLIPPAGE:.2f}; rides")
+                return None
+
+        hedge_usdc = shares * hedge_px
 
         # Locked P&L: $1/pair redemption minus both legs' cost and taker fees.
         pnl = (shares
                - size_usdc - shares * pricing.taker_fee_per_share(entry)
-               - hedge_usdc - shares * pricing.taker_fee_per_share(opp_ask))
+               - hedge_usdc - shares * pricing.taker_fee_per_share(hedge_px))
 
         if not self.paper_mode:
             token_id = window.up_token_id if opp_side == "UP" else window.down_token_id
@@ -149,20 +183,20 @@ class Executor:
                 logger.error(f"Box hedge order failed: {exc}")
                 return None
 
-        state.close_position(pos["id"], opp_ask, round(pnl, 4), 0.0, "BOXED")
+        state.close_position(pos["id"], hedge_px, round(pnl, 4), 0.0, "BOXED")
         state.resolve_taker_ledger(pos["market_id"], "BOXED", round(pnl, 4))
         state.record_trade({
             "asset": self.asset,
             "market_id": pos["market_id"], "start_ts": int(window.start_ts),
-            "leg": "BOX", "side": opp_side, "price": opp_ask,
-            "detail": f"box {side}@{entry:.3f} + {opp_side}@{opp_ask:.3f} "
+            "leg": "BOX", "side": opp_side, "price": round(hedge_px, 4),
+            "detail": f"box {side}@{entry:.3f} + {opp_side}@{hedge_px:.3f} "
                       f"({shares:.1f}sh, locked {pnl:+.2f})",
             "size_usdc": round(hedge_usdc, 2), "pnl_usdc": 0.0,
             "status": "RESOLVED", "outcome": "BOXED", "closed_at": time.time(),
         })
         logger.info(
             f"[{'PAPER' if self.paper_mode else 'LIVE'}][BOX][{self.asset}] {side}@{entry:.3f} "
-            f"hedged with {opp_side}@{opp_ask:.3f} | locked pnl={pnl:+.2f}"
+            f"hedged with {opp_side}@{hedge_px:.3f} | locked pnl={pnl:+.2f}"
         )
         self._active_order_id   = None
         self._active_pos_id     = None
@@ -250,7 +284,25 @@ class Executor:
     # ─── Paper execution ───────────────────────────────────────────────────────
 
     def _paper_execute(self, signal: Signal, window: MarketWindow, side: str,
-                       price: float, size_usdc: float, order_type: str) -> bool:
+                       price: float, size_usdc: float, order_type: str,
+                       book=None) -> bool:
+        # ── Conservative fill realism for the directional TAKER leg ───────────────
+        # Walk the REAL displayed ask depth (VWAP) instead of assuming our full stake
+        # fills at the touch, and pay an extra adverse tick for snapshot→order latency.
+        # A too-thin / empty book means no fill (we don't manufacture liquidity).
+        if (config.PAPER_FILL_REALISM and book is not None
+                and order_type == "TAKER" and price and price > 0):
+            tick = _tick(getattr(window, "tick_size", "0.01"))
+            want_shares = size_usdc / price
+            filled_shares, vwap = book.fill_ask(side, want_shares)
+            if filled_shares <= 0:
+                logger.info(f"[PAPER][{self.asset}] {side} IOC unfilled — ask book empty/"
+                            f"too thin (wanted {want_shares:.1f}sh) — skipped")
+                return False
+            fill_price = min(0.99, vwap + config.PAPER_SLIPPAGE_TICKS * tick)
+            price = round(fill_price, 4)
+            size_usdc = round(filled_shares * price, 2)   # actual cash deployed (may be partial)
+
         order_id = f"PAPER-{self.asset}-{int(signal.ts * 1000)}"
         pos_id = state.open_position({
             "asset":        self.asset,

@@ -56,6 +56,30 @@ class OrderBookSide:
         with self._lock:
             return self._levels.get(round(price, 4), 0.0)
 
+    def vwap_buy(self, shares: float) -> tuple[float, float]:
+        """
+        Simulate a marketable BUY that lifts up to `shares` off this (ask) ladder,
+        cheapest level first. Returns (filled_shares, avg_price). If the book is empty
+        or too thin, filled_shares < shares (or 0). Used by paper execution so a fill is
+        priced against real displayed depth instead of assuming infinite size at the touch.
+        """
+        if shares <= 0:
+            return 0.0, 0.0
+        with self._lock:
+            levels = sorted(self._levels.items())   # (price, size) ascending price
+        remaining = shares
+        cost = 0.0
+        for price, size in levels:
+            take = min(remaining, size)
+            cost += take * price
+            remaining -= take
+            if remaining <= 1e-9:
+                break
+        filled = shares - remaining
+        if filled <= 0:
+            return 0.0, 0.0
+        return filled, cost / filled
+
 
 class TokenBook:
     """Combined bid+ask book for one token (Up or Down)."""
@@ -93,6 +117,10 @@ class TokenBook:
         self.bids.apply_snapshot(bids)
         self.asks.apply_snapshot(asks)
         self.last_update = time.time()
+
+    def fill_ask(self, shares: float) -> tuple[float, float]:
+        """Depth-aware marketable buy against this token's asks. See OrderBookSide.vwap_buy."""
+        return self.asks.vwap_buy(shares)
 
     def apply_price_change(self, side: str, price: float, size: float):
         if side == "BID":
@@ -176,6 +204,12 @@ class PolymarketBook:
     @property
     def down_bid(self) -> Optional[float]:
         return self.down_book.best_bid
+
+    def fill_ask(self, side: str, shares: float) -> tuple[float, float]:
+        """Depth-aware marketable buy of `shares` on the UP or DOWN token's asks.
+        Returns (filled_shares, avg_price)."""
+        book = self.up_book if side == "UP" else self.down_book
+        return book.fill_ask(shares)
 
     @property
     def up_spread(self) -> Optional[float]:

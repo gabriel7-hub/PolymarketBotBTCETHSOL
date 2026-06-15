@@ -217,7 +217,7 @@ class AssetWorker:
                 elif signal.action in (Action.IOC_UP, Action.IOC_DOWN):
                     allowed, _ = self.risk.check()
                     if allowed and window.condition_id != last_executed_window:
-                        if self.executor.execute(signal, window):
+                        if self.executor.execute(signal, window, book=self.book):
                             last_executed_window = window.condition_id
                             # Guarantee this taker is resolved even if the loop stalls
                             # through the close tick (else it stays OPEN and blocks the
@@ -452,7 +452,7 @@ class AssetWorker:
         margin = (config.BOX_STOP_MARGIN_LOSS if locking_loss
                   else config.BOX_STOP_MARGIN_PROFIT)
         if p_side < 1.0 - opp_ask - margin:
-            pnl = self.executor.box_position(window, pos, opp_ask)
+            pnl = self.executor.box_position(window, pos, opp_ask, book=self.book)
             if pnl is not None and pnl < 0:
                 # A boxed loss is still a wrong call — count it for the cooldown.
                 self.risk.on_loss()
@@ -598,6 +598,7 @@ class BotRunner:
 
         self.workers = {a: AssetWorker(a, paper_mode=paper_mode) for a in config.ASSETS}
         self._dash_state: dict = {}
+        self._last_maintenance = time.time()
         self._stop = threading.Event()
 
     def get_dashboard_state(self) -> dict:
@@ -615,12 +616,27 @@ class BotRunner:
         try:
             while not self._stop.is_set():
                 self._update_dash_state()
+                self._maybe_maintain()
                 time.sleep(config.STATE_PUSH_INTERVAL)
         except KeyboardInterrupt:
             logger.info("Shutting down...")
             for w in self.workers.values():
                 w.stop()
                 w.executor.cancel_open_order()
+
+    def _maybe_maintain(self):
+        """Periodically reclaim DB space and truncate the WAL so a multi-day session stays
+        bounded and crash-safe. Cheap and off the hot per-tick path (runs ~hourly)."""
+        if time.time() - self._last_maintenance < config.MAINTENANCE_INTERVAL_SECS:
+            return
+        self._last_maintenance = time.time()
+        try:
+            pruned = state.prune_old_data(config.TICK_RETENTION_DAYS)
+            state.checkpoint()
+            if pruned:
+                logger.info(f"Maintenance: pruned {pruned} old tick/signal row(s); WAL checkpointed")
+        except Exception as exc:
+            logger.warning(f"Maintenance pass failed: {exc}")
 
     def _update_dash_state(self):
         try:
@@ -653,10 +669,34 @@ class BotRunner:
             logger.error(f"Dashboard state aggregation error: {exc}")
 
 
+def _ensure_healthy_db():
+    """Refuse to run on a malformed database. A corrupt bot_state.db (e.g. from an unclean
+    shutdown, or from `cp`-ing a live WAL file) silently drops writes and can crash the
+    loop mid-week. If the existing file fails its integrity check, quarantine it aside and
+    start fresh so the session still records clean data."""
+    import os
+    if not os.path.exists(config.DB_PATH):
+        return
+    if state.integrity_ok():
+        return
+    quarantine = f"{config.DB_PATH}.corrupt.{int(time.time())}"
+    logger.error(f"DB {config.DB_PATH} FAILED integrity check — quarantining to "
+                 f"{quarantine} and starting fresh. Recover with `sqlite3 {quarantine} "
+                 f"'.recover' | sqlite3 recovered.db` if you need its rows.")
+    for suffix in ("", "-wal", "-shm"):
+        src = config.DB_PATH + suffix
+        if os.path.exists(src):
+            try:
+                os.rename(src, quarantine + suffix)
+            except OSError as exc:
+                logger.error(f"Could not move {src} aside: {exc}")
+
+
 def main():
     args = parse_args()
     setup_logging()
     paper_mode = (args.mode == "paper")
+    _ensure_healthy_db()
 
     if args.assets:
         wanted = [a.strip().upper() for a in args.assets.split(",") if a.strip()]
