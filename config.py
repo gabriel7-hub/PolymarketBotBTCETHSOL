@@ -73,14 +73,21 @@ MIN_EV_TAKER         = 0.03    # min fee-net EV per share ($) to fire an IOC tak
                                # 0.015 after out-of-sample validation: 0.03 cleared the coin-flip
                                # fee-peak zone and gave the best held-out P&L at vol_mult=0.7.
 MIN_EV_MAKER         = 0.005   # min EV per share ($) for a rebate-farm maker quote
-MIN_TAKER_ENTRY      = 0.50    # never IOC a side whose ask is below this. VPS data (684 resolved
-                               # trades, 2026-06-07..10): entries <0.20 won 5.5% vs 12.7% implied
-                               # (model said 14-21%) — the Gaussian barrier tails are badly over-
-                               # confident, mostly right at zone-open (t_rem≈215-219). Sub-0.35
-                               # entries netted −$431; 0.35-0.50 was breakeven noise (±$250/day,
-                               # +$23 net). The entire edge lives at 0.50-0.65 (+$509). Replay with
-                               # this floor: +$661 on 464 trades vs +$253 on all 684. Revisit with
-                               # `backtest.py --buckets` once a bucket shows real edge.
+MIN_TAKER_ENTRY      = 0.72    # never IOC a side whose ask is below this. RAISED 0.50→0.72
+                               # 2026-06-20: the old 0.50 floor (from 684-window VPS data that
+                               # claimed "the edge lives at 0.50-0.65") is OVERTURNED by the
+                               # 8,044-window recovered backtest. By resolved entry-price bucket:
+                               #   0.50-0.60  win 50.9%  net −$1,269   (paying 55¢ for coin flips)
+                               #   0.60-0.70  win 63.8%  net −$306
+                               #   0.70-0.80  win 85.1%  net +$620  (+$3.09/trade)  ← edge starts
+                               #   0.80+      win 95.6%  net +$539  (+$2.63/trade)
+                               # The coin-flip zone (<0.70) is where ALL the bleed is and where the
+                               # directional taker fails out-of-sample. 0.72 confines the live taker
+                               # to the favorite zone — the same near-certain region the validated
+                               # certainty/feed-lag gate trades (APPROACH.md §1.6). NOTE: this stops
+                               # the bleed but the bare taker still isn't OOS-clean even here; the
+                               # real fix is promoting the certainty shadow leg once it survives
+                               # depth-realistic paper fills. Revisit with `backtest.py --buckets`.
 BOX_STOP_ENABLED     = True    # hedge-to-box stop-loss on the open taker position
 # Box trigger: p_side < 1 − opposite_ask − margin. One margin was doing two opposing
 # jobs, so it is split by what the box would lock (entry + opposite_ask vs $1):

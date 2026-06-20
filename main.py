@@ -91,6 +91,7 @@ class AssetWorker:
         self._last_farm: dict = {}               # last farm quote details for dashboard
         self._stop = threading.Event()
         self._readopt_open_positions()           # resume (not cancel) in-flight positions
+        self._reconcile_shadow_trades()          # settle shadow rows orphaned by a restart
 
     def _readopt_open_positions(self):
         """
@@ -119,6 +120,30 @@ class AssetWorker:
         for start_ts, mkt in state.get_recent_fallback_windows(limit=20, asset=self.asset):
             if start_ts not in self._resolved:
                 self._awaiting_real[start_ts] = mkt
+
+    def _reconcile_shadow_trades(self):
+        """Settle isolated shadow-leg rows (CERTAINTY) orphaned by a restart: the in-memory
+        tracker is lost on restart, so a row whose window has since resolved would otherwise
+        hang OPEN forever. Score any OPEN row whose window now has a winning outcome."""
+        import pricing
+        healed = 0
+        for tr in state.get_open_shadow_trades(self.asset, "CERTAINTY"):
+            o = state.get_outcome(tr["start_ts"], self.asset)
+            winning = o.get("winning_side") if o else None
+            if winning not in ("UP", "DOWN"):
+                continue
+            entry = tr["price"]
+            shares = (tr["size_usdc"] / entry) if entry else 0.0
+            won = (tr["side"] == winning)
+            fee = pricing.taker_fee_per_share(entry) * shares
+            pnl = ((1.0 - entry) if won else -entry) * shares - fee
+            state.update_trade(tr["id"], status="RESOLVED",
+                               outcome=("WIN" if won else "LOSS"),
+                               pnl_usdc=round(pnl, 4), closed_at=time.time())
+            self._cert_shadow_session += pnl
+            healed += 1
+        if healed:
+            logger.info(f"[{self.asset}] Reconciled {healed} orphaned CERTAINTY shadow row(s)")
 
     def start(self):
         self.discovery.start()
@@ -289,6 +314,11 @@ class AssetWorker:
                                 "side": cside, "price": entry, "shares": shares,
                                 "trade_id": tid,
                             }
+                            # Guarantee the window gets resolved even if no real taker fires
+                            # and the 1s loop misses the close tick — otherwise this shadow row
+                            # hangs OPEN forever (it fires far from close, at t-45..220s).
+                            if start_ts not in self._resolved:
+                                self._pending[start_ts] = window.condition_id
                             logger.info(f"[PAPER·SHADOW][{self.asset}] certainty "
                                         f"{cside} ask={cask:.2f} fill={entry:.3f} "
                                         f"sh={shares:.1f}")

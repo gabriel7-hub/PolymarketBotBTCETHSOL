@@ -319,6 +319,18 @@ def update_trade(trade_id: int, **fields):
         conn.execute(f"UPDATE trades SET {cols} WHERE id = :_id", fields)
 
 
+def get_open_shadow_trades(asset: str, leg: str) -> list:
+    """OPEN ledger rows for an isolated shadow leg (e.g. 'CERTAINTY'). Used to reconcile
+    rows orphaned by a restart — the in-memory tracker is lost, so a row whose window has
+    since resolved would otherwise hang OPEN forever."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, start_ts, side, price, size_usdc FROM trades "
+            "WHERE asset = ? AND leg = ? AND status = 'OPEN'", (asset, leg)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def record_farm_accrual(start_ts: int, market_id: str, side: str, detail: str,
                         size_usdc: float, reward_delta: float, asset: str = "BTC"):
     """

@@ -54,6 +54,23 @@ for wallet evidence.
   resolves them in `_resolve_cert_shadow` against the REAL outcome, and reports a session tally on
   the dashboard. Hard-gated to paper — cannot place a live order. Compiles, imports, and 7/7 gate
   unit-tests pass.
+- **2026-06-20 — Fixed CERTAINTY rows hanging OPEN.** Root cause: the real taker leg queues its
+  window for resolution (`self._pending[start_ts]=…`) but the certainty shadow didn't — so when a
+  cert bet was the only activity in a window (no real taker) and the 1s loop missed the close tick,
+  the window never resolved and the row hung OPEN (it fires at t-45..220s, far from close; LATE_MOM
+  escapes this firing at t-12..25s). Fix: (1) cert-open now sets `_pending` like the taker; (2) new
+  `state.get_open_shadow_trades()` + `AssetWorker._reconcile_shadow_trades()` settles rows orphaned
+  across a restart (in-memory tracker is lost on restart) against the resolved outcome on startup.
+  Verified on a temp DB (resolved→settled WIN/LOSS, unresolved→left OPEN). Deploy + restart heals
+  the currently-stuck BTC 08:00 row automatically.
+- **2026-06-20 — Stopped the live bleed: `MIN_TAKER_ENTRY 0.50 → 0.72`.** Diagnosis from the
+  live dashboard: session −$52 was 100% the legacy directional TAKER leg firing at ask 0.57/0.60
+  (the coin-flip zone, both LOSS); the CERTAINTY shadow won (SOL UP@0.80 +$5.97) but is shadow-only
+  so it doesn't offset. The old 0.50 floor's justification is overturned by the 8,044-window buckets
+  (edge only ≥0.70). 0.72 confines the live taker to the favorite zone. Stopgap — the bare taker is
+  still not OOS-clean; the real fix is promoting the certainty gate once depth-realistic paper fills
+  pass. (Also seen: `BOT DISCONNECTED` — bot was down; the startup reconcile heals the orphan on
+  restart.)
 - **NEXT:** (a) run paper (`python3 main.py --mode paper`) for a few days at `VOL_MULT=0.5` to
   accumulate live depth-realistic `leg='CERTAINTY'` rows; (b) compare that live shadow P&L vs the
   backtest's +$719 OOS — if the depth-walk doesn't kill it (PF holds, ideally → 1.5), promote to a
