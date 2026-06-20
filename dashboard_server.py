@@ -92,27 +92,45 @@ class DashboardServer:
     async def _index(self, request):
         if not os.path.exists(_INDEX):
             return web.Response(status=404, text="dashboard/index.html not found")
-        return web.FileResponse(_INDEX)
+        # No-cache so a freshly-pulled dashboard JS always loads (a normal browser refresh
+        # was serving the cached old client, which is why prior UI fixes appeared to "not
+        # take" — the page never reloaded the new code).
+        return web.FileResponse(_INDEX, headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache", "Expires": "0",
+        })
 
     async def _ws(self, request):
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
         peer = request.remote
         logger.debug(f"Dashboard client connected: {peer}")
-        try:
-            # Send an immediate snapshot, then push on every interval.
-            snap = self._state_fn()
-            if snap:
-                await ws.send_str(_dumps(snap))
-            while not ws.closed:
+        # Push every interval. A failure to BUILD or SERIALIZE the snapshot must NOT tear
+        # down the socket (that surfaced as a spurious "BOT DISCONNECTED" the user had to
+        # refresh away) — only a real transport error ends the loop.
+        first = True
+        while not ws.closed:
+            if not first:
                 await asyncio.sleep(config.STATE_PUSH_INTERVAL)
+            first = False
+            try:
                 snap = self._state_fn()
-                if snap:
-                    await ws.send_str(_dumps(snap))
-        except (ConnectionResetError, asyncio.CancelledError):
-            pass
-        except Exception as exc:
-            logger.debug(f"Dashboard ws error: {exc}")
-        finally:
-            logger.debug(f"Dashboard client disconnected: {peer}")
+            except Exception as exc:
+                logger.debug(f"Dashboard state build failed (kept connection): {exc}")
+                continue
+            if not snap:
+                continue
+            try:
+                payload = _dumps(snap)
+            except Exception as exc:
+                logger.debug(f"Dashboard serialize failed (kept connection): {exc}")
+                continue
+            try:
+                await ws.send_str(payload)
+            except (ConnectionResetError, asyncio.CancelledError):
+                break                      # client really gone
+            except Exception as exc:
+                logger.debug(f"Dashboard ws send failed: {exc}")
+                break
+        logger.debug(f"Dashboard client disconnected: {peer}")
         return ws

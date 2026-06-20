@@ -84,6 +84,16 @@ for wallet evidence.
   (3) don't add STRIKE-MISSED windows to `_pending` at all (nothing to settle; ticks excluded from
   calibration anyway); (4) startup reconcile now VOIDs stale OPEN certainty orphans. All compile;
   has_reference gate verified.
+- **2026-06-20 — BOT-DISCONNECTED, server-side hardening.** Found two concrete fixable causes:
+  (1) the WS handler dropped the client on ANY transient state-build/serialize error (now isolated
+  per-iteration — only a real transport error ends the loop); (2) `index.html` served with no cache
+  headers, so a normal browser refresh kept running the OLD (latching) dashboard JS — added
+  `Cache-Control: no-cache`. Also wrapped the startup shadow-reconcile so a bad row can't crash
+  worker construction (a crash there would restart-loop the bot → miss strikes). **Open root:** the
+  recurring **STRIKE MISSED** in every screenshot means `oracle.price` is 0 within 3s of T=0 — i.e.
+  feeds dead at the boundary, which almost always means the BOT PROCESS is restarting (or feeds
+  dropping) at window opens. Historical recovered DB captured strikes fine, so this is a NEW runtime
+  issue needing the VPS logs to pin (is `"Bot started"` repeating? what's the MISSED reason line?).
 - **NEXT:** (a) run paper (`python3 main.py --mode paper`) for a few days at `VOL_MULT=0.5` to
   accumulate live depth-realistic `leg='CERTAINTY'` rows; (b) compare that live shadow P&L vs the
   backtest's +$719 OOS — if the depth-walk doesn't kill it (PF holds, ideally → 1.5), promote to a

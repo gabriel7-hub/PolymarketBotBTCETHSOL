@@ -124,7 +124,16 @@ class AssetWorker:
     def _reconcile_shadow_trades(self):
         """Settle isolated shadow-leg rows (CERTAINTY) orphaned by a restart: the in-memory
         tracker is lost on restart, so a row whose window has since resolved would otherwise
-        hang OPEN forever. Score any OPEN row whose window now has a winning outcome."""
+        hang OPEN forever. Score any OPEN row whose window now has a winning outcome.
+
+        Wrapped so a single bad row can NEVER crash worker construction — a crash here would
+        loop the whole bot through restart, and every restart misses that window's strike."""
+        try:
+            self._do_reconcile_shadow_trades()
+        except Exception as exc:
+            logger.error(f"[{self.asset}] shadow reconcile failed (non-fatal): {exc}")
+
+    def _do_reconcile_shadow_trades(self):
         import pricing
         healed = void = 0
         stale_after = config.MARKET_WINDOW_SECS + config.RESOLUTION_GIVEUP_SECS
