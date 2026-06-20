@@ -84,6 +84,8 @@ class AssetWorker:
         self._arbed: set[int] = set()            # windows we already arbed
         self._late_mom: dict[int, dict] = {}     # start_ts -> open late-momentum shadow bet
         self._late_mom_session: float = 0.0      # paper P&L of the experimental late-mom leg
+        self._cert_shadow: dict[int, dict] = {}  # start_ts -> open certainty/feed-lag shadow bet
+        self._cert_shadow_session: float = 0.0   # paper P&L of the certainty shadow leg
         self._last_tick_ts: float = time.time()
         self._farm_reward_session: float = 0.0   # est reward accrued this session
         self._last_farm: dict = {}               # last farm quote details for dashboard
@@ -246,6 +248,51 @@ class AssetWorker:
                         logger.info(f"[PAPER·EXPERIMENTAL][{self.asset}] late-momentum "
                                     f"{signal.order_side}@{signal.order_price:.2f}")
 
+                # Certainty / feed-lag SHADOW leg (APPROACH.md §3①) — PAPER ONLY, fully
+                # isolated: a separate `if` (not part of the elif dispatch), so it never
+                # preempts or is preempted by the real legs. Records one leg='CERTAINTY'
+                # ledger row per window via the live book's PAPER_FILL_REALISM path; no real
+                # position, no risk-guard interaction. Resolved in _resolve_cert_shadow.
+                if self.paper_mode and start_ts not in self._cert_shadow:
+                    pick = self.engine.certainty_shadow(signal)
+                    if pick is not None:
+                        cside, cask = pick
+                        # Depth-realistic fill: DECIDE on the displayed ask, FILL by walking
+                        # the live book (VWAP) + one adverse latency tick — the very realism
+                        # the backtest could not model from top-of-book ticks. A too-thin /
+                        # empty ask book means no fill (we don't manufacture liquidity).
+                        entry, shares = cask, config.CERTAINTY_SIZE_USDC / cask
+                        if config.PAPER_FILL_REALISM and self.book is not None:
+                            tick = float(getattr(window, "tick_size", None) or config.TICK_SIZE)
+                            filled, vwap = self.book.fill_ask(cside, shares)
+                            if filled <= 0:
+                                logger.info(f"[PAPER·SHADOW][{self.asset}] certainty {cside} "
+                                            f"unfilled — ask book empty/too thin")
+                                filled = 0
+                            else:
+                                entry = min(0.99, vwap + config.PAPER_SLIPPAGE_TICKS * tick)
+                                shares = filled
+                        else:
+                            filled = shares
+                        if filled > 0:
+                            tid = state.record_trade({
+                                "asset": self.asset,
+                                "market_id": window.condition_id, "start_ts": start_ts,
+                                "leg": "CERTAINTY", "side": cside, "price": round(entry, 4),
+                                "detail": f"CERTAINTY {cside} ask={cask:.2f} fill={entry:.3f} "
+                                          f"p={signal.p_up:.3f} T-{signal.time_remaining:.0f}s "
+                                          f"(paper shadow)",
+                                "size_usdc": round(shares * entry, 2),
+                                "status": "OPEN", "outcome": None,
+                            })
+                            self._cert_shadow[start_ts] = {
+                                "side": cside, "price": entry, "shares": shares,
+                                "trade_id": tid,
+                            }
+                            logger.info(f"[PAPER·SHADOW][{self.asset}] certainty "
+                                        f"{cside} ask={cask:.2f} fill={entry:.3f} "
+                                        f"sh={shares:.1f}")
+
                 # Box-stop: hedge the open taker into a $1 box if the signal flipped.
                 self._maybe_box_position(signal, window)
 
@@ -347,6 +394,7 @@ class AssetWorker:
             })
             self._resolve_position(condition_id, winning)
             self._resolve_late_mom(start_ts, winning)
+            self._resolve_cert_shadow(start_ts, winning)
             if source == "FALLBACK":
                 logger.info(f"[{self.asset}] Window {start_ts} settled (paper, oracle): "
                             f"{winning} — chasing real outcome in background")
@@ -423,6 +471,28 @@ class AssetWorker:
         logger.info(f"[PAPER·EXPERIMENTAL][{self.asset}] late-momentum {lm['side']} "
                     f"{'WIN' if won else 'LOSS'} pnl={pnl:+.2f} "
                     f"(session {self._late_mom_session:+.2f})")
+
+    def _resolve_cert_shadow(self, start_ts: int, winning_side: str):
+        """Settle the certainty/feed-lag shadow bet for a window (paper-only). Isolated from
+        the real position lifecycle — scores its own ledger row + a session tally so the leg's
+        live (depth-realistic) P&L can be compared against the backtest. Authoritative number
+        is still backtest.py --certainty on REAL outcomes."""
+        cs = self._cert_shadow.pop(start_ts, None)
+        if not cs:
+            return
+        import pricing
+        entry = cs["price"]
+        shares = cs.get("shares") or (config.CERTAINTY_SIZE_USDC / entry)
+        won = (cs["side"] == winning_side)
+        fee = pricing.taker_fee_per_share(entry) * shares
+        pnl = ((1.0 - entry) if won else -entry) * shares - fee
+        state.update_trade(cs["trade_id"], status="RESOLVED",
+                           outcome=("WIN" if won else "LOSS"),
+                           pnl_usdc=round(pnl, 4), closed_at=time.time())
+        self._cert_shadow_session += pnl
+        logger.info(f"[PAPER·SHADOW][{self.asset}] certainty {cs['side']} "
+                    f"{'WIN' if won else 'LOSS'} pnl={pnl:+.2f} "
+                    f"(session {self._cert_shadow_session:+.2f})")
 
     def _maybe_box_position(self, signal, window):
         """
@@ -577,6 +647,9 @@ class AssetWorker:
                 "late_mom_enabled": config.LATE_MOMENTUM_ENABLED,
                 "late_mom_open": len(self._late_mom),
                 "late_mom_session": round(self._late_mom_session, 2),
+                "cert_shadow_enabled": config.CERTAINTY_SHADOW_ENABLED,
+                "cert_shadow_open": len(self._cert_shadow),
+                "cert_shadow_session": round(self._cert_shadow_session, 2),
             },
             "position": state.get_open_position(self.asset),
             "risk_status": self.risk.status_str(),

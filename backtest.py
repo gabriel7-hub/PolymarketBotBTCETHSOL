@@ -145,6 +145,72 @@ def simulate_taker(rows, vol_mult: float, min_ev: float = None):
     return pnls
 
 
+# ─── §3① Certainty / feed-lag gate (MEASUREMENT ONLY — not wired to live) ───────
+
+def simulate_certainty(rows, vol_mult: float, certainty_floor: float = 0.80,
+                       lag_margin: float = 0.03, max_ask: float = 0.97,
+                       min_ev: float = 0.0, slippage: float = 0.0):
+    """
+    APPROACH.md §3① — buy NEAR-CERTAIN outcomes the book hasn't repriced yet.
+
+    The leaderboard research + our own calibration say the durable edge is NOT predicting the
+    5-min random walk (that taker leg fails out-of-sample) but entering a side only when:
+      • the recalibrated model is already CONFIDENT      (p_side ≥ certainty_floor), AND
+      • the book still UNDERPRICES that confidence (lag)  (ask ≤ p_side − lag_margin), AND
+      • the ask isn't so high the fee eats the edge       (ask ≤ max_ask),
+    with the usual spread + fee-net-EV guards. p_up + p_down = 1, so at most one side clears a
+    floor ≥ 0.5 — no coin-flip-zone trades by construction. One trade per window, flat stake
+    (kept flat for an apples-to-apples comparison with simulate_taker; Kelly sizing is a later,
+    separately-validated refinement). This is a backtest probe only; nothing here can place an
+    order.
+
+    `slippage` ($/share) stresses fill realism the way config.PAPER_FILL_REALISM does live: we
+    DECIDE on the displayed ask but FILL one adverse tick worse (entry = min(0.99, ask+slippage)).
+    Only the latency-tick component is modelled — recorded ticks store top-of-book only, so the
+    VWAP depth-walk over the ladder (the other half of live realism) cannot be reproduced from
+    this data and is NOT captured.
+    """
+    by_window: dict[tuple, list] = {}
+    for r in rows:
+        by_window.setdefault(_wkey(r), []).append(r)
+
+    pnls = []
+    for wkey, ticks in by_window.items():
+        winning = ticks[0]["winning_side"]
+        for r in sorted(ticks, key=lambda x: -x["t_remaining"]):
+            t = r["t_remaining"]
+            if not (config.TAKER_ZONE_END <= t <= config.TAKER_ZONE_START):
+                continue
+            p = _p_up(r, vol_mult)
+            up_ask, dn_ask = r["up_ask"], r["down_ask"]
+            # Confident side only (at most one of UP/DOWN can clear a floor ≥ 0.5).
+            if p >= certainty_floor and up_ask:
+                side, p_side, ask, bid = "UP", p, up_ask, r["up_bid"]
+            elif (1 - p) >= certainty_floor and dn_ask:
+                side, p_side, ask, bid = "DOWN", 1 - p, dn_ask, r["down_bid"]
+            else:
+                continue
+            spread = (ask - bid) if (ask and bid) else None
+            if spread is not None and spread > config.MAX_SPREAD:
+                continue
+            if ask > max_ask:                          # too rich — fee eats the edge
+                continue
+            if (p_side - ask) < lag_margin:            # book hasn't lagged enough — no edge
+                continue
+            if pricing.taker_ev_per_share(p_side, ask) < min_ev:
+                continue
+            # Decide on the displayed ask; fill one adverse tick worse (latency realism).
+            entry = min(0.99, ask + slippage)
+            shares = config.MAX_STAKE_PER_MARKET / entry
+            won = (side == winning)
+            fee = pricing.taker_fee_per_share(entry) * shares
+            pnl = ((1.0 - entry) if won else -entry) * shares - fee
+            pnls.append(pnl)
+            break   # one trade per window
+
+    return pnls
+
+
 # ─── Out-of-sample validation (train/test split) ───────────────────────────────
 
 def _pnl_metrics(pnls) -> dict:
@@ -304,6 +370,59 @@ def report_buckets(db_path: str, asset: str = None):
     print("  (need ≥50 trades/bucket and edge_pts ≥ +3 before lowering MIN_TAKER_ENTRY)")
 
 
+def report_certainty(rows, vol_mult: float, certainty_floor: float,
+                     lag_margin: float, max_ask: float):
+    """Score the §3① certainty/feed-lag gate: full-sample P&L, per-asset, and an HONEST
+    fixed-rule out-of-sample split (SAME params on chrono train/test — no param search, so it
+    can't overfit the test set). Plus a sensitivity sweep over floor × lag_margin."""
+    slip = config.PAPER_SLIPPAGE_TICKS * float(config.TICK_SIZE)   # adverse latency tick ($/share)
+    print(f"\n{'='*64}\nCERTAINTY / FEED-LAG GATE  (APPROACH.md §3① — measurement only, not live)")
+    print(f"  params: vol_mult={vol_mult}  certainty_floor={certainty_floor}  "
+          f"lag_margin={lag_margin}  max_ask={max_ask}")
+    print(f"  fill realism: IDEAL = fill at displayed ask;  REALISTIC = +{slip:.2f}/share "
+          f"adverse tick (latency). Depth-walk VWAP not capturable from top-of-book ticks.")
+
+    def _line(tag, m):
+        print(f"    {tag:<11} n={m['n']:>4}  win={m['win']:.1%}  net=${m['net']:+.2f}  "
+              f"PF={m['pf']:.2f}  EV/t=${m['ev']:+.3f}")
+
+    print("\n  FULL SAMPLE:")
+    _line("IDEAL", _pnl_metrics(simulate_certainty(rows, vol_mult, certainty_floor, lag_margin, max_ask)))
+    _line("REALISTIC", _pnl_metrics(simulate_certainty(rows, vol_mult, certainty_floor, lag_margin,
+                                                       max_ask, slippage=slip)))
+
+    by_asset: dict[str, list] = {}
+    for r in rows:
+        by_asset.setdefault(_wkey(r)[0], []).append(r)
+    if len(by_asset) > 1:
+        print("\n  per-asset (REALISTIC fills):")
+        for a in sorted(by_asset):
+            m = _pnl_metrics(simulate_certainty(by_asset[a], vol_mult, certainty_floor,
+                                                lag_margin, max_ask, slippage=slip))
+            print(f"    {a}: trades={m['n']:>4}  win={m['win']:.1%}  "
+                  f"net=${m['net']:+.2f}  PF={m['pf']:.2f}")
+
+    # Honest OOS: identical fixed rule on chronological train/test (no tuning on test).
+    train, test, n_tr, n_te = _split_chrono(rows, 0.7)
+    print(f"\n  FIXED-RULE OOS (chrono 70/30, no param search — honest)  [REALISTIC fills]:")
+    _line("train", _pnl_metrics(simulate_certainty(train, vol_mult, certainty_floor, lag_margin,
+                                                   max_ask, slippage=slip)))
+    mte = _pnl_metrics(simulate_certainty(test, vol_mult, certainty_floor, lag_margin,
+                                          max_ask, slippage=slip))
+    _line("test", mte)
+    print(f"    → live gate: PF≥1.5 & net>0  ⇒  {'PASS' if (mte['pf']>=1.5 and mte['net']>0) else 'below gate'}")
+    if n_te < 20:
+        print(f"    ⚠  only {n_te} test windows — indicative, not final.")
+
+    print(f"\n  sensitivity sweep (full sample, REALISTIC fills, max_ask={max_ask}):")
+    print(f"    {'floor':>6}{'lag':>6}{'trades':>8}{'win%':>7}{'net$':>11}{'PF':>6}{'EV/t':>8}")
+    for floor in (0.75, 0.80, 0.85, 0.90):
+        for lag in (0.02, 0.03, 0.05):
+            m = _pnl_metrics(simulate_certainty(rows, vol_mult, floor, lag, max_ask, slippage=slip))
+            print(f"    {floor:>6.2f}{lag:>6.2f}{m['n']:>8}{100*m['win']:>7.1f}"
+                  f"{m['net']:>11.2f}{m['pf']:>6.2f}{m['ev']:>8.3f}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -321,6 +440,14 @@ def main():
     ap.add_argument("--buckets", action="store_true",
                     help="executed-trade win rate vs breakeven by entry-price bucket "
                          "(evidence for MIN_TAKER_ENTRY)")
+    ap.add_argument("--certainty", action="store_true",
+                    help="score the §3① certainty/feed-lag gate (measurement only, not live)")
+    ap.add_argument("--cert-floor", type=float, default=0.80,
+                    help="min model prob for the side to qualify as 'certain' (default 0.80)")
+    ap.add_argument("--lag-margin", type=float, default=0.03,
+                    help="min book lag p_side−ask required to enter (default 0.03)")
+    ap.add_argument("--max-ask", type=float, default=0.97,
+                    help="never buy above this ask — fee eats the edge (default 0.97)")
     ap.add_argument("--db", default=config.DB_PATH,
                     help="state.db to read (e.g. a downloaded VPS copy)")
     args = ap.parse_args()
@@ -351,7 +478,9 @@ def main():
         print(f"⚠  Only {n_windows} resolved window(s) of data — far below the ~300 needed "
               f"for trustworthy calibration. Treat results as directional, not final.\n")
 
-    if args.validate:
+    if args.certainty:
+        report_certainty(rows, args.vol_mult, args.cert_floor, args.lag_margin, args.max_ask)
+    elif args.validate:
         validate(rows, train_frac=args.train_frac)
     elif args.sweep:
         print("Vol-mult sweep (lower Brier = better calibrated):")

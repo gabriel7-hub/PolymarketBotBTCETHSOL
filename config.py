@@ -144,11 +144,19 @@ RESOLUTION_GIVEUP_SECS   = 900 # if a window still can't be resolved this long a
 VOL_WINDOW_SECS      = 45      # rolling window of log-returns for realized vol estimate
 MOMENTUM_WINDOW_SECS = 15      # seconds of price history for the 15s momentum diagnostic
 VOL_FLOOR_PER_SEC    = 1.0e-5  # floor on per-second return vol (avoid div-by-zero / overconfidence)
-VOL_MULT             = 0.7     # live σ scaling. Validated out-of-sample (backtest.py --validate,
-                               # 258 REAL windows, 2026-06-08): vol_mult=1.0 lost on every held-out
-                               # test slice (53% win, −$ net); vol_mult=0.7 was profitable on all
-                               # splits (66–71% win, PF 1.47–2.13). At 1.0 the model's σ was too
-                               # wide → probabilities too timid → fake EV near 50¢ paying peak fee.
+VOL_MULT             = 0.5     # live σ scaling. RECALIBRATED 2026-06-19 on 8,044 REAL-resolved
+                               # windows (recovered DB; prior 0.7 was tuned on only 258). The Brier
+                               # sweep bottoms at vol_mult=0.5 on ALL three assets (BTC 0.163, ETH
+                               # 0.158, SOL 0.155; all monotonic, well under the 0.25 gate). The
+                               # calibration table showed the model was OVER-DISPERSED at 0.7 —
+                               # empirical outcomes are more extreme than predicted on both tails
+                               # (model said P=0.65 when reality was ~0.72), i.e. σ too wide →
+                               # probabilities pulled toward 0.5. Shrinking σ fixes that and lets the
+                               # model correctly flag genuine high-certainty states. NOTE: this is a
+                               # CALIBRATION fix only — the bare directional EV-gated taker still
+                               # FAILS out-of-sample at 0.5 (validate: TEST net −$1140, PF 0.97), so
+                               # do NOT read this as "the taker is now profitable." It is the
+                               # prerequisite for the certainty/feed-lag gate (APPROACH.md §3①).
                                # Re-confirm with `backtest.py --validate` as more REAL data accrues.
 DRIFT_WEIGHT         = 0.0     # momentum→drift weight; 0 = pure driftless (theoretically correct)
 BASIS_VOL_INFLATE    = 1.0     # how much CEX disagreement (bp) inflates σ → pulls P toward 0.5
@@ -204,6 +212,24 @@ LATE_MOMENTUM_MAX_ASK    = 0.90    # don't chase near-certainties (fee makes EV 
 LATE_MOMENTUM_ZONE_START = 25      # secs remaining: late-momentum window opens
 LATE_MOMENTUM_ZONE_END   = 12      # secs remaining: stop (stay out of the latency-dead final ~10s)
 LATE_MOMENTUM_SIZE_USDC  = 25.0    # paper notional per late-momentum bet
+
+# ─── Certainty / Feed-Lag Gate (APPROACH.md §3① · paper SHADOW · measurement) ───
+# The ONLY leg with a genuine out-of-sample edge in backtest (recovered 8,044 windows,
+# vol_mult=0.5): buy the side the recalibrated model is already confident in WHEN the book
+# still underprices that confidence (feed lag). OOS test +$719 net / PF 1.24 even after a
+# 1-tick adverse-fill stress — but PF is below the 1.5 live-capital gate, AND the backtest
+# could not model the order-book depth-walk (recorded ticks are top-of-book only). So we run
+# it as an ISOLATED PAPER SHADOW first: it reads the already-computed signal, records its own
+# leg='CERTAINTY' ledger rows, never opens a real position, never touches the risk guard, and
+# is hard-gated to paper in main.py. The point is to capture DEPTH-REALISTIC fills via the live
+# book's PAPER_FILL_REALISM path before any real-capital leg. Fires in the TAKER zone.
+# Mirrors the backtest gate: enter the confident side iff  p_side ≥ FLOOR  AND
+# ask ≤ p_side − LAG_MARGIN  AND  ask ≤ MAX_ASK  AND spread ≤ MAX_SPREAD AND fee-net EV ≥ 0.
+CERTAINTY_SHADOW_ENABLED = True    # master switch (paper-only effect). False = complete no-op.
+CERTAINTY_FLOOR      = 0.80        # min model prob for the side to count as "certain"
+CERTAINTY_LAG_MARGIN = 0.03        # min book lag (p_side − ask) required to enter
+CERTAINTY_MAX_ASK    = 0.97        # never buy above this — taker fee eats the edge past here
+CERTAINTY_SIZE_USDC  = 25.0        # paper notional per certainty bet
 
 # ─── Fee Constants (Fee Structure V2, effective Mar 30 2026) ───────────────────
 # Crypto taker fee = C × 0.07 × p × (1−p), per share. Makers pay zero.

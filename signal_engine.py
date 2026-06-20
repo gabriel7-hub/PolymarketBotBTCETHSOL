@@ -260,6 +260,39 @@ class SignalEngine:
         s.order_side, s.order_price, s.order_type = side, ask, "TAKER"
         return s
 
+    # ─── Certainty / feed-lag gate (APPROACH.md §3① · paper shadow) ─────────────
+
+    def certainty_shadow(self, s: Signal) -> Optional[tuple]:
+        """
+        APPROACH.md §3① certainty/feed-lag pick, as an ISOLATED read of the already-computed
+        signal. Deliberately NOT routed through evaluate()/Action dispatch, so it can neither
+        preempt nor be preempted by the real legs — main records it on its own paper ledger.
+        Mirrors backtest.simulate_certainty: take the confident side only when the book still
+        underprices it. Returns (side, ask) or None.
+        """
+        if not config.CERTAINTY_SHADOW_ENABLED:
+            return None
+        t = s.time_remaining
+        if not (config.TAKER_ZONE_END <= t <= config.TAKER_ZONE_START):
+            return None
+        floor = config.CERTAINTY_FLOOR
+        # p_up + p_down = 1 ⇒ at most one side clears a floor ≥ 0.5 (no coin-flip trades).
+        if s.p_up >= floor and s.up_ask is not None:
+            side, p_side, ask, bid = "UP", s.p_up, s.up_ask, s.up_bid
+        elif s.p_down >= floor and s.down_ask is not None:
+            side, p_side, ask, bid = "DOWN", s.p_down, s.down_ask, s.down_bid
+        else:
+            return None
+        if bid is not None and (ask - bid) > config.MAX_SPREAD:
+            return None
+        if ask > config.CERTAINTY_MAX_ASK:                 # too rich — fee eats the edge
+            return None
+        if (p_side - ask) < config.CERTAINTY_LAG_MARGIN:   # book hasn't lagged enough
+            return None
+        if pricing.taker_ev_per_share(p_side, ask) < 0:    # not fee-net positive
+            return None
+        return side, ask
+
     # ─── Two-sided liquidity-reward farm leg ───────────────────────────────────
 
     def _reward_farm(self, mk, window, mid, up_bid, up_ask, down_bid, down_ask) -> Optional[Signal]:
