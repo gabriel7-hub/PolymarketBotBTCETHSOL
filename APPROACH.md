@@ -71,6 +71,19 @@ for wallet evidence.
   still not OOS-clean; the real fix is promoting the certainty gate once depth-realistic paper fills
   pass. (Also seen: `BOT DISCONNECTED` — bot was down; the startup reconcile heals the orphan on
   restart.)
+- **2026-06-20 — Fixed STRIKE-MISSED bogus trades + BOT-DISCONNECTED stall (linked bugs).**
+  Symptom: CERTAINTY trades firing at ask 0.18/0.33/0.34 (not "certain"), and frequent
+  `BOT DISCONNECTED` / `STRIKE MISSED`. Root causes: (1) `certainty_shadow` didn't gate on
+  `window.has_reference` (the real taker/late-mom do) — with no strike, the model prices vs ref=0
+  and returns garbage p≈0.99, firing the gate on cheap asks. (2) Pass-1 resolution called
+  `fetch_resolution` (HTTP) for EVERY closed pending window EVERY cycle, unbounded; a missed-strike
+  window (ref=0) can't fallback-settle, so it hammered HTTP for 900s and stalled the 1s loop →
+  state push starves → dashboard flips to BOT DISCONNECTED → strike thread misses more (cascade).
+  Fixes: (1) gate certainty on `window.has_reference`; (2) cap Pass-1 fetches at
+  `RESOLUTION_MAX_FETCH_PER_CYCLE` (valid-strike windows still fallback-settle when over budget);
+  (3) don't add STRIKE-MISSED windows to `_pending` at all (nothing to settle; ticks excluded from
+  calibration anyway); (4) startup reconcile now VOIDs stale OPEN certainty orphans. All compile;
+  has_reference gate verified.
 - **NEXT:** (a) run paper (`python3 main.py --mode paper`) for a few days at `VOL_MULT=0.5` to
   accumulate live depth-realistic `leg='CERTAINTY'` rows; (b) compare that live shadow P&L vs the
   backtest's +$719 OOS — if the depth-walk doesn't kill it (PF holds, ideally → 1.5), promote to a

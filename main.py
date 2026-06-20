@@ -126,24 +126,31 @@ class AssetWorker:
         tracker is lost on restart, so a row whose window has since resolved would otherwise
         hang OPEN forever. Score any OPEN row whose window now has a winning outcome."""
         import pricing
-        healed = 0
+        healed = void = 0
+        stale_after = config.MARKET_WINDOW_SECS + config.RESOLUTION_GIVEUP_SECS
         for tr in state.get_open_shadow_trades(self.asset, "CERTAINTY"):
             o = state.get_outcome(tr["start_ts"], self.asset)
             winning = o.get("winning_side") if o else None
-            if winning not in ("UP", "DOWN"):
-                continue
-            entry = tr["price"]
-            shares = (tr["size_usdc"] / entry) if entry else 0.0
-            won = (tr["side"] == winning)
-            fee = pricing.taker_fee_per_share(entry) * shares
-            pnl = ((1.0 - entry) if won else -entry) * shares - fee
-            state.update_trade(tr["id"], status="RESOLVED",
-                               outcome=("WIN" if won else "LOSS"),
-                               pnl_usdc=round(pnl, 4), closed_at=time.time())
-            self._cert_shadow_session += pnl
-            healed += 1
-        if healed:
-            logger.info(f"[{self.asset}] Reconciled {healed} orphaned CERTAINTY shadow row(s)")
+            if winning in ("UP", "DOWN"):
+                entry = tr["price"]
+                shares = (tr["size_usdc"] / entry) if entry else 0.0
+                won = (tr["side"] == winning)
+                fee = pricing.taker_fee_per_share(entry) * shares
+                pnl = ((1.0 - entry) if won else -entry) * shares - fee
+                state.update_trade(tr["id"], status="RESOLVED",
+                                   outcome=("WIN" if won else "LOSS"),
+                                   pnl_usdc=round(pnl, 4), closed_at=time.time())
+                self._cert_shadow_session += pnl
+                healed += 1
+            elif time.time() - tr["start_ts"] > stale_after:
+                # Window long past with no real outcome (e.g. a STRIKE-MISSED bogus row from
+                # before the has_reference fix) — VOID it so it can't hang OPEN forever.
+                state.update_trade(tr["id"], status="VOID", outcome="VOID",
+                                   pnl_usdc=0.0, closed_at=time.time())
+                void += 1
+        if healed or void:
+            logger.info(f"[{self.asset}] Reconciled CERTAINTY shadows: "
+                        f"{healed} settled, {void} voided")
 
     def start(self):
         self.discovery.start()
@@ -278,7 +285,11 @@ class AssetWorker:
                 # preempts or is preempted by the real legs. Records one leg='CERTAINTY'
                 # ledger row per window via the live book's PAPER_FILL_REALISM path; no real
                 # position, no risk-guard interaction. Resolved in _resolve_cert_shadow.
-                if self.paper_mode and start_ts not in self._cert_shadow:
+                # Require a valid strike: with no Price-to-Beat the model prices against
+                # ref=0 and returns a garbage p≈0.99, which would fire the gate on cheap
+                # asks (the STRIKE-MISSED bug). The real taker/late-mom legs gate on this too.
+                if (self.paper_mode and window.has_reference
+                        and start_ts not in self._cert_shadow):
                     pick = self.engine.certainty_shadow(signal)
                     if pick is not None:
                         cside, cask = pick
@@ -328,8 +339,12 @@ class AssetWorker:
 
                 # Window closing: queue for resolution and snapshot the settle price
                 # (oracle price at close) — used as the paper fallback if the real
-                # on-chain outcome never arrives.
-                if window.time_remaining < 2 and start_ts not in self._resolved:
+                # on-chain outcome never arrives. Only for windows with a real strike:
+                # a STRIKE-MISSED window has no position to settle (every leg requires a
+                # strike) and its ticks are dropped from calibration (ref_price>0 filter),
+                # so tracking it only feeds the unresolvable-pending backlog.
+                if (window.has_reference and window.time_remaining < 2
+                        and start_ts not in self._resolved):
                     self._pending[start_ts] = window.condition_id
                     if start_ts not in self._settles and self.oracle.price > 0:
                         self._settles[start_ts] = self.oracle.price
@@ -379,11 +394,21 @@ class AssetWorker:
         # ── Pass 1: settle POSITIONS quickly at close so they don't carry into the next
         #            window. Prefer the real outcome if it's already available; otherwise
         #            (paper) settle on our oracle after a short grace and keep chasing REAL.
+        fetched = 0
         for start_ts, condition_id in list(self._pending.items()):
             closed_at = start_ts + config.MARKET_WINDOW_SECS
             if time.time() < closed_at:
                 continue
-            winning = self.discovery.fetch_resolution(start_ts)
+            # Bound synchronous HTTP per cycle (as Pass 2 already does). A missed-strike
+            # window has no ref → can't fallback-settle → it would otherwise hammer
+            # fetch_resolution every cycle for 900s and stall the 1s loop (which delays the
+            # state push → dashboard flips to BOT DISCONNECTED). Over budget we skip the fetch
+            # this cycle; valid-strike windows still settle via the fallback path below.
+            if fetched < config.RESOLUTION_MAX_FETCH_PER_CYCLE:
+                winning = self.discovery.fetch_resolution(start_ts)
+                fetched += 1
+            else:
+                winning = None
             ref = self._get_ref(start_ts)
             settle = self._settles.get(start_ts) or self.oracle.price
             predicted = "UP" if (ref and settle >= ref) else "DOWN"
