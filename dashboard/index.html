@@ -379,8 +379,10 @@ function connect(){
   if(ws&&ws.readyState<2)return;
   ws=new WebSocket(WS_URL);
   ws.onopen=()=>{led('led-ws',true);off(false);if(reTimer){clearTimeout(reTimer);reTimer=null}};
-  ws.onclose=ws.onerror=()=>{led('led-ws',false);off(true);reTimer=setTimeout(connect,2500)};
-  ws.onmessage=e=>{try{const d=JSON.parse(e.data);last=Date.now();render(d)}catch(_){}}
+  ws.onclose=ws.onerror=()=>{led('led-ws',false);off(true);if(reTimer)clearTimeout(reTimer);reTimer=setTimeout(connect,2500)};
+  // Fresh data arrived ⇒ we're connected. Clear the stale/disconnected badge immediately
+  // (the watchdog only ever SET it, so without this it stuck until a manual refresh).
+  ws.onmessage=e=>{try{const d=JSON.parse(e.data);last=Date.now();off(false);led('led-ws',true);render(d)}catch(_){}}
 }
 function off(s){document.getElementById('off').classList.toggle('show',s)}
 function led(id,on){const e=document.getElementById(id);e.className='led '+(on?'on':'off')}
@@ -571,7 +573,10 @@ function tm(ts){if(!ts)return'—';return new Date(ts*1000).toLocaleTimeString('
 function winTitle(t){const m=t.match(/(\d{1,2}:\d{2}(?:AM|PM)-\d{1,2}:\d{2}(?:AM|PM))/);return m?m[1]:t.slice(0,22)}
 
 setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString('en-US',{hour12:false});
-  if(Date.now()-last>5000&&ws&&ws.readyState===1)off(true)},1000);
+  // While the socket is OPEN, toggle the badge BOTH ways by data freshness — so a brief
+  // push gap that latched it clears automatically once data resumes (no refresh needed).
+  // When the socket is closed, onclose owns the badge and the reconnect timer.
+  if(ws&&ws.readyState===1)off(Date.now()-last>5000)},1000);
 connect();
 </script>
 </body>
