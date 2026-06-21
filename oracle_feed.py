@@ -21,6 +21,7 @@ import json
 import math
 import time
 import threading
+import urllib.request
 from collections import deque
 from typing import Optional
 import websocket
@@ -191,6 +192,7 @@ class ChainlinkFeed:
     def _connect(self):
         self._ws = websocket.WebSocketApp(
             config.CHAINLINK_RTDS_URL,
+            header=config.RTDS_WS_HEADERS,   # Cloudflare drops a plain handshake (2026-06-21)
             on_open=self._on_open, on_message=self._on_message,
             on_error=self._on_error, on_close=self._on_close,
         )
@@ -248,12 +250,85 @@ class ChainlinkFeed:
             logger.warning(f"ChainlinkFeed parse error: {exc}")
 
 
+class ChainlinkOnchainFeed:
+    """
+    On-chain Chainlink aggregator (Polygon) read via plain JSON-RPC — a strike anchor for
+    when the RTDS Data-Streams socket is unreachable. Polls `latestRoundData()` on a heartbeat
+    cadence and exposes the same `current_price` / `fresh` surface as `ChainlinkFeed`, so the
+    Oracle can prefer it over the CEX proxy. Verified far closer to the real Price to Beat than
+    the proxy (2026-06-21: on-chain BTC/USD ≈ 0.5bp vs proxy ≈ 4.5bp). NOT the exact settlement
+    price (the heartbeat lags Data Streams), so it is a fallback, not the primary.
+    """
+    _SEL_LATEST = "0xfeaf968c"   # latestRoundData()
+    _SEL_DECIMALS = "0x313ce567"  # decimals()
+
+    def __init__(self, asset: str = "BTC"):
+        self.asset = asset
+        self._addr = config.ASSET_PARAMS[asset].get("chainlink_agg")
+        self.current_price: float = 0.0
+        self._updated_at: float = 0.0     # on-chain updatedAt (unix secs)
+        self._decimals: Optional[int] = None
+        self._stop = threading.Event()
+
+    def start(self):
+        if not (config.CHAINLINK_ONCHAIN_ENABLED and self._addr):
+            return
+        threading.Thread(target=self._run_loop, daemon=True,
+                         name=f"cl-onchain-{self.asset.lower()}").start()
+        logger.info(f"ChainlinkOnchainFeed[{self.asset}] started (Polygon {self._addr[:10]}…)")
+
+    def stop(self):
+        self._stop.set()
+
+    @property
+    def fresh(self) -> bool:
+        """True only if the latest on-chain round updated recently (heartbeat-driven)."""
+        return (self.current_price > 0
+                and (time.time() - self._updated_at) <= config.CHAINLINK_ONCHAIN_MAX_STALE)
+
+    def _rpc(self, data: str) -> Optional[str]:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                           "params": [{"to": self._addr, "data": data}, "latest"]}).encode()
+        for url in config.CHAINLINK_RPC_URLS:
+            try:
+                req = urllib.request.Request(url, data=body, headers={
+                    "Content-Type": "application/json", "User-Agent": "curl/8"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return json.load(r).get("result")
+            except Exception:
+                continue
+        return None
+
+    def _run_loop(self):
+        while not self._stop.is_set():
+            try:
+                if self._decimals is None:
+                    d = self._rpc(self._SEL_DECIMALS)
+                    if d:
+                        self._decimals = int(d, 16)
+                if self._decimals is not None:
+                    res = self._rpc(self._SEL_LATEST)
+                    if res and len(res) >= 2 + 64 * 5:
+                        w = [res[2 + i * 64:2 + (i + 1) * 64] for i in range(5)]
+                        ans = int(w[1], 16)
+                        if ans >= 2 ** 255:
+                            ans -= 2 ** 256
+                        updated = int(w[3], 16)
+                        if ans > 0 and updated > 0:
+                            self.current_price = ans / (10 ** self._decimals)
+                            self._updated_at = float(updated)
+            except Exception as exc:
+                logger.debug(f"ChainlinkOnchainFeed[{self.asset}] poll error: {exc}")
+            self._stop.wait(timeout=config.CHAINLINK_ONCHAIN_POLL_SECS)
+
+
 class Oracle:
     """
     Settlement price layer. Primary = the EXACT Chainlink data-stream price (Polymarket
     RTDS) that settles these markets, so `.price` and the strike match Polymarket's "Price
-    to Beat" exactly. Coinbase/Binance are kept as a high-frequency vol estimate, a basis
-    diagnostic, and a fallback if the Chainlink socket drops.
+    to Beat" exactly. If the RTDS socket is down, an ON-CHAIN Chainlink aggregator (Polygon)
+    is the next-best strike anchor; the Coinbase/Binance blend is the last resort (and the
+    high-frequency vol estimate + basis diagnostic).
     """
 
     def __init__(self, binance, asset: str = "BTC",
@@ -264,11 +339,13 @@ class Oracle:
         self._binance = binance
         self._coinbase = coinbase or CoinbaseFeed(asset)
         self._chainlink = chainlink or ChainlinkFeed(asset)
+        self._chainlink_onchain = ChainlinkOnchainFeed(asset)
         self._w = coinbase_weight
 
     def start(self):
         self._coinbase.start()
         self._chainlink.start()
+        self._chainlink_onchain.start()
 
     @property
     def chainlink(self) -> ChainlinkFeed:
@@ -284,6 +361,25 @@ class Oracle:
                 or self._binance.connected)
 
     @property
+    def chainlink_price(self) -> float:
+        """The best available Chainlink price: RTDS Data-Streams when fresh, else on-chain."""
+        if self._chainlink.fresh:
+            return self._chainlink.current_price
+        if self._chainlink_onchain.fresh:
+            return self._chainlink_onchain.current_price
+        return 0.0
+
+    @property
+    def strike_source(self) -> str:
+        """Which feed `price` (and therefore the snapshotted strike) is coming from RIGHT NOW.
+        'rtds' = exact Price to Beat; 'onchain' = ~0.5bp Chainlink anchor; 'proxy' = CEX ~4-5bp."""
+        if self._chainlink.fresh:
+            return "rtds"
+        if self._chainlink_onchain.fresh:
+            return "onchain"
+        return "proxy"
+
+    @property
     def _cex_blend(self) -> float:
         cb = self._coinbase.current_price
         bn = self._binance.current_price
@@ -294,25 +390,29 @@ class Oracle:
     @property
     def price(self) -> float:
         """
-        EXACT Chainlink settlement price (Polymarket's Price to Beat) WHEN it is fresh.
-        The RTDS Chainlink feed is sparse, so when it's stale/absent we use the reliable
-        high-frequency Coinbase-weighted CEX blend — the strike is then a ~4bp proxy
-        (already covered by basis-σ widening) rather than going stale or empty.
+        Settlement price, best source first:
+          1. RTDS Chainlink Data Streams (the EXACT Price to Beat) when fresh,
+          2. else the on-chain Chainlink aggregator (~0.5bp strike anchor) when fresh,
+          3. else the high-frequency Coinbase-weighted CEX blend (~4-5bp proxy; σ-widened).
+        Keeps the strike always captured at T=0 while preferring the lowest-basis source.
         """
         if self._chainlink.fresh:
             return self._chainlink.current_price
+        if self._chainlink_onchain.fresh:
+            return self._chainlink_onchain.current_price
         return self._cex_blend
 
     @property
     def cex_basis_bp(self) -> float:
         """
-        Disagreement (bp) used to widen σ. When the Chainlink feed is fresh, |Chainlink −
-        Coinbase| (the true settlement-vs-proxy gap); otherwise |Binance − Coinbase|.
+        Disagreement (bp) used to widen σ. When a Chainlink price (RTDS or on-chain) is fresh,
+        |Chainlink − Coinbase| (the true settlement-vs-proxy gap); otherwise |Binance − Coinbase|.
         """
         cb = self._coinbase.current_price
         bn = self._binance.current_price
-        if self._chainlink.fresh and cb > 0:
-            return abs(bp(self._chainlink.current_price, cb))
+        cl = self.chainlink_price
+        if cl > 0 and cb > 0:
+            return abs(bp(cl, cb))
         if cb > 0 and bn > 0:
             return abs(bp(bn, cb))
         return 0.0

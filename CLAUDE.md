@@ -1,173 +1,153 @@
 # PolymarketBot — CLAUDE.md
 
-**Market:** Polymarket BTC / ETH / SOL Up/Down 5-Minute (multi-asset since 2026-06-11)  
-**Strategy:** Calibrated fair-value engine → (1) fee-net IOC taker, (2) rebate/reward farming  
-**Edge:** A correctly-modeled, vol-calibrated probability vs a sometimes-stale order book, traded only when expected value clears the actual per-price fee. Plus maker rebates as yield.
+**Market:** Polymarket BTC / ETH / SOL Up/Down 5-Minute (multi-asset)
+**Thesis (current):** A vol-calibrated fair-value engine that does **one** validated thing —
+**buy near-certain favorites in the last 10–45s that a stale order book hasn't repriced yet**
+(feed-lag certainty). Everything else (bare directional prediction, reward farming, arbitrage)
+has been measured to be zero-to-negative edge on these markets and is **off or paper-only**.
+**Edge is measured in paper before any capital — that gate has not yet been cleared.**
 
-> **Design note (foundation rebuild).** The original "stale-order maker harvester" thesis
-> was retired: resting limit orders below fair value get **adversely selected** (you only
-> fill when informed flow trades against you), and the ~0.35% rebate does not pay for it.
-> We also do **not** attempt last-second (Phase-3) sniping — a 1s Python loop cannot win
-> that latency race against co-located bots. We compete on **calibration + mid-window
-> mispricings + rebate yield**, and we **measure edge in paper before risking capital.**
-
----
-
-## Project Status (2026-06-11) — FINAL paper-trading architecture
-
-**Multi-asset expansion (this round, final):** the bot now trades **BTC, ETH and SOL**
-5-min windows concurrently (XRP defined in `ASSET_PARAMS`, off by default).
-- One **`AssetWorker` per asset** (`main.py`): its own Binance/Coinbase/Chainlink-RTDS
-  feeds, CLOB book socket, window discovery, signal engine, executor, strike thread and
-  1s loop — fully isolated; one asset's stall cannot miss another's strike.
-- **Asset-aware schema**: `asset` column on positions/signals/ticks/trades; `outcomes`
-  rebuilt with `PRIMARY KEY (asset, start_ts)` (the 300s grid collides across assets).
-  Migration is automatic, idempotent, and verified on the real DB (all prior rows = BTC).
-- **Risk**: open-position guard + cooldown are **per asset**; `MAX_DAILY_LOSS` stays
-  **global** (one bankroll). `MAX_STAKE_PER_MARKET` applies per asset-window.
-- **Dashboard**: POLYDESK has asset tabs (per-asset day P&L + open-position dot);
-  trade history shows an Asset column. State shape: `{bot, assets:{BTC,ETH,SOL}, ledger}`.
-- **Backtest**: joins on `(asset, start_ts)`, `--asset` filter, per-asset breakdown.
-  3× window throughput ⇒ the ≥300-window calibration bar fills ~3× faster.
-- Run subsets via `--assets BTC,ETH` or env `ASSETS=...`.
-
-## Previous Status (2026-06-06)
-
-**Foundation rebuild — complete & verified live (paper):**
-- ✅ **Oracle/settlement fixed.** Coinbase-weighted `Oracle` proxy + cross-venue basis;
-  real Chainlink-based resolution fetched from the resolved event (no Binance proxy).
-- ✅ **Deterministic discovery.** Window slug built from the clock; events endpoint;
-  token IDs + reward params parsed from the real `clobTokenIds`/`outcomes` schema.
-- ✅ **Vol-barrier model + EV gating** (`barrier_p_up`, `pricing.py`). Verified sane
-  (0.5 at boundary, sharper as t→0, basis inflates σ).
-- ✅ **Recorder + backtester** (`ticks`/`outcomes` tables, `backtest.py --sweep`) —
-  runs end-to-end on real recorded data (Brier/calibration/P&L).
-- ✅ **Strike snapshot** clock-driven at the T=0 boundary with a MISSED guard (verified
-  rejecting late windows so we never trade a wrong strike).
-- ✅ **Leaderboard strategies added** (see `LEADERBOARD_ANALYSIS.md`): ① YES/NO arbitrage
-  and ③ two-sided reward farm, both firing live in paper.
-- ✅ **Dashboard rewritten** (POLYDESK) and fully wired to live WS state.
-
-**Bugs found & fixed during validation:**
-- Polymarket market WS **ignores a 2nd subscription on the same socket** (proven: 0 books
-  on re-subscribe) → every window after the first traded on an empty book. Now reconnects
-  per window. *(`polymarket_book.subscribe`)*
-- **Cross-window resolution misattribution** — a resolving window closed whatever position
-  was open; now matched by `condition_id`. *(`main._resolve_position`)*
-- `RiskGuard` read the DB before `init_db()`; `_dash_state` field drift; PONG parse noise.
-
-**Not yet proven (gating live):** the model is calibrated machinery but only ~1 valid-strike
-window has resolved so far — needs ≥300 windows of recorded data before the Brier/P&L numbers
-mean anything. See Paper→Live Checklist.
+> **Read this first (design philosophy).** Three theses have been *retired by evidence*, not opinion:
+> 1. **Stale-order maker harvesting** — resting limits below fair value get adversely selected;
+>    the rebate doesn't pay for it.
+> 2. **Last-second sniping** — a 1s Python loop cannot win a latency race to *react to a new move*
+>    against co-located bots. (We do NOT do this.)
+> 3. **Bare directional EV-taker** — predicting the 5-min random walk *fails out-of-sample* even at
+>    best calibration (8,044-window backtest: TEST −$1,140, PF 0.97). **Disabled** (`DIRECTIONAL_TAKER_ENABLED=False`).
+>
+> What survives evidence is **feed-lag certainty buying** (the winners' actual edge) — and even that
+> is run **paper-only** until depth-realistic fills clear PF ≥ 1.5. See `APPROACH.md`.
 
 ---
 
-## Upcoming Enhancements (roadmap)
+## Project Status (2026-06-21)
 
-**Next round — make edge measurable & real:**
-1. **Accumulate ≥300 windows** of paper `ticks`+`outcomes`, then `backtest.py --sweep` to
-   calibrate `VOL_WINDOW_SECS` / vol-mult until the calibration table is flat (Brier well < 0.25).
-2. **Tune EV thresholds** (`MIN_EV_TAKER`, `MIN_ARB_EDGE`) and `BASIS_VOL_INFLATE` from the
-   recorded basis distribution; confirm profit factor ≥ 1.5 on the taker leg.
+**Operating leg = certainty / feed-lag gate (paper).** On the recovered 8,044-window DB, this is the
+only leg with a genuine out-of-sample edge, and the edge is **concentrated in the last 10–45s**:
 
-**Then — live execution hardening (separate, risk-bearing round):**
-3. **SPLIT / MERGE** in `executor.py` (mint $1 → 1 UP + 1 DOWN) to fund two-sided inventory
-   cheaply — prerequisite for live farm + arb. *(LEADERBOARD_ANALYSIS #3)*
-4. **Real two-sided order management** for the farm leg: place/refresh/cancel both quotes,
-   track net inventory & delta-neutrality, reconcile fills, real reward accrual from
-   `/activity` (`MAKER_REBATE`/`REWARD`/`YIELD`) instead of the paper estimate.
-5. **Live fill handling** for the taker/arb legs: partial fills, slippage guard
-   (`MAX_SLIPPAGE`), settlement reconciliation against on-chain outcome.
+| Firing zone (realistic +1-tick fill) | win % | PF | EV/trade |
+|---|---|---|---|
+| 45–220s (mid-window) | 81.8% | 1.14 | $0.68 |
+| **10–45s (late slice)** | 86.4% | **1.59** | **$2.03** |
+| **10–45s + move ≥ 5bp** | 89.2% | **1.91** | **$2.51** |
+| **10–45s + move ≥ 10bp** | 92.0% | **2.57** | **$3.18** |
 
-**Additive edges (after the above):**
-6. **Copy-trade signal** — poll `data-api/activity` for sharp crypto wallets (e.g. `strike123`,
-   `Dropper`, `prayingnotbroke`) as a *confirmation* feature into the model. *(LEADERBOARD #4)*
-7. **Cross-asset consistency** — compare implied moves across BTC/ETH/SOL/XRP 5-min windows
-   to flag mispriced books. *(LEADERBOARD #5)*
-8. **Latency**: move the 1s loop to event-driven (react to book ticks) so mid-window taker
-   fills are less stale. Still NOT attempting last-second sniping.
-9. **Optional**: true Chainlink Data Streams feed (credentialed) to replace the Coinbase
-   proxy and shrink strike basis error.
+The late slice clears the PF ≥ 1.5 live gate; the mid-window does not. So the gate now fires down to
+**T-10s**, requires the oracle to have **already moved ≥ 5bp from strike** (the winners' "Window
+Delta" signal), and **sizes up** in the validated late slice. It is **paper-only** — it records a
+`leg='CERTAINTY'` ledger row via the live book's depth-walk + adverse-tick fill, never opens a real
+position. (Reproduce: `python3 backtest.py --db <recovered.db> --certainty`; probe
+`sy/cert_zone_experiment.py`.)
+
+**What's off / dead (by evidence):**
+- **Bare directional taker** (`Action.IOC_*`) — `DIRECTIONAL_TAKER_ENABLED=False` (fails OOS, was the
+  live bleed: a −$52 session was 100% this leg).
+- **Reward farm** — BTC/ETH/SOL 5-min markets carry `rewards.rates=null` (pool unfunded; verified via
+  CLOB `getMarketInfo` 2026-06-21). Quoting earns ~$0; **dropped from the 5-min thesis.** Only EVENT
+  markets with a funded `rates` pool pay. (`FARM_ENABLED=True` is a harmless no-op here — the leg
+  self-skips on a null pool.)
+- **YES/NO arbitrage** — fires so rarely it's statistically nil (+$29 / 34 trades historically).
+  Left enabled (risk-free when it does fire) but not a pillar.
+
+**The box exit is acknowledged selection bias, not edge.** Historically the system was net-positive
+*only* because the hedge-to-box exit harvested favorable drift while adverse drift rode to a full
+loss. `PAPER_FILL_REALISM=True` exists to stress whether that 21¢ hedge is real in live depth.
+
+**Not yet proven (gating live capital):** the certainty leg's PF is **1.24 OOS** (< the 1.5 gate), and
+the order-book **depth-walk VWAP** is unmeasured (backtest used top-of-book ticks). A clean paper run
+that walks the real book is what decides it. See Paper→Live Checklist.
+
+---
+
+## Multi-asset architecture (BTC / ETH / SOL)
+
+One **`AssetWorker` per asset** (`main.py`): its own Binance/Coinbase/Chainlink-RTDS feeds, CLOB book
+socket, clock-driven window discovery, signal engine, executor, strike thread and 1s loop — fully
+isolated, so one asset's stall cannot miss another's strike. XRP is defined in `ASSET_PARAMS` but off
+by default. Run subsets via `--assets BTC,ETH` or env `ASSETS=...`.
+
+- **Asset-aware schema:** `asset` column on positions/signals/ticks/trades; `outcomes` keyed
+  `PRIMARY KEY (asset, start_ts)` (the 300s grid collides across assets). Migration is automatic and
+  idempotent.
+- **Risk:** open-position guard + cooldown are **per asset**; `MAX_DAILY_LOSS` is **global** (one
+  bankroll). `MAX_STAKE_PER_MARKET` applies per asset-window.
+- **Dashboard:** POLYDESK with asset tabs (per-asset day P&L, open-position dot, strike-thread
+  health), countdown ring, model-vs-market prob bar, strategy pipeline, and an asset-tagged trade log
+  including the paper `CERTAINTY` shadow tally.
+- **Backtest:** joins on `(asset, start_ts)`, `--asset` filter, per-asset breakdown.
 
 ---
 
 ## Market Mechanics
 
-Every 5 minutes per asset: `"Bitcoin/Ethereum/Solana Up or Down — June 6, 11:30AM–11:35AM ET"`.
-Markets are Gamma **events** with slug `<btc|eth|sol>-updown-5m-<start_unix_ts>`, where
-`start_ts` is a unix multiple of 300 → we construct each window's slug directly from the
-clock (all assets share the same grid and the same schema — verified live 2026-06-11).
-- T=0: window opens; **Chainlink BTC/USD (Data Streams)** price is the reference (strike).
-- T=300s: if Chainlink BTC ≥ reference → Up wins ($1.00), else Down wins ($1.00).
-- **Resolution source is `https://data.chain.link/streams/btc-usd`** — NOT Binance. We
-  model against a **Coinbase-weighted oracle proxy** and widen σ by the cross-venue basis.
-  The strike is not published pre-resolution, so the bot **snapshots it at window open**.
+Every 5 minutes per asset: `"Bitcoin/Ethereum/Solana Up or Down — June 21, 8:40AM–8:45AM ET"`.
+Markets are Gamma **events** with slug `<btc|eth|sol>-updown-5m-<start_unix_ts>`, where `start_ts`
+is a unix multiple of 300 → we build each window's slug directly from the clock.
+
+- **T=0:** window opens; the **Chainlink BTC/USD (Data Streams)** price is the reference (strike).
+  The strike is **not published pre-resolution**, so the bot **snapshots it at window open** (within
+  `REFERENCE_MAX_LAG=3s`; a late snapshot flags the window `MISSED` and it is never traded — a wrong
+  strike manufactures phantom edge).
+- **T=300s:** if Chainlink price ≥ reference → Up wins ($1.00), else Down wins ($1.00).
+- **Resolution source is `https://data.chain.link/streams/btc-usd`** — NOT Binance. We model against a
+  **Coinbase-weighted oracle proxy** and widen σ by the cross-venue basis; the **real** outcome is
+  fetched from the resolved event.
 - Core invariant: `P_UP + P_DOWN = $1.00`.
-- **Fees (V2, Mar 2026):** Taker = `C × 0.07 × p × (1−p)` per share (max ~1.75% at 50¢,
-  tiny at the extremes). Maker = 0. Maker rebate = 20% of the crypto taker pool, paid daily.
+- **Fees (V2, Mar 2026):** Taker = `0.07 · p · (1−p)` per share (max ~1.75% at 50¢, ~0 at the
+  extremes). Maker = 0. Maker rebate = 20% of the crypto taker pool — but the 5-min liquidity-rewards
+  **pool is unfunded** (`rates=null`), so it pays nothing here.
 
 ---
 
-## Competitive Landscape
+## Strategy: one fair value, evaluated each tick (`signal_engine.evaluate`)
 
-| Generation | Strategy | Status |
-|---|---|---|
-| Gen 1 | Pure latency arb (Binance lag → Polymarket) | **DEAD** — fees > spread |
-| Gen 2 | Last-second IOC takers (30–60s snipe) | Alive but 50+ co-located bots — we don't compete here |
-| Gen 3 | Directional stale-order maker harvester | **RETIRED** — adverse selection (see design note) |
-| **Gen 4 (us)** | **Calibrated fair value → reward farm + YES/NO arb + mid-window taker** | **Current** |
-
-Gen 1 turned $313 → $438K then died on dynamic fees. The leaderboard's durable, infra-light
-money in our niche is **reward/rebate farming** (Group C: ~0 PnL on huge volume, all yield is
-incentives) and **arbitrage** — not directional conviction. Full breakdown with wallets and
-inferred strategies in `LEADERBOARD_ANALYSIS.md`.
-
----
-
-## Strategy: One Fair Value, Three Legs (priority order)
-
-Each tick `signal_engine.evaluate()` checks legs in priority order (see `LEADERBOARD_ANALYSIS.md`
-for why these are the durable edges in our niche):
+Priority order, but in the current config only the certainty shadow + (rare) arb actually act:
 
 ```
-① ARBITRAGE  (any time)        risk-free, leaderboard Group B
-   up_ask + down_ask < 1 − fees  →  buy both, guaranteed $1 payout.
-   Gated by MIN_ARB_EDGE (locked $/pair after both taker fees). Once per window.
+① ARBITRAGE  (any time, risk-free)            ENABLED but ~never fires
+   up_ask + down_ask < 1 − fees  →  buy both, guaranteed $1. Gated by MIN_ARB_EDGE.
 
-② FAIR-VALUE TAKER  [45s ≤ t_rem ≤ 220s]   directional, needs a strike
-   IOC at best ask only when fee-net EV/share ≥ MIN_EV_TAKER and spread ≤ MAX_SPREAD.
+② BARE DIRECTIONAL TAKER  [45s ≤ t ≤ 220s]    DISABLED (DIRECTIONAL_TAKER_ENABLED=False)
+   IOC at best ask on fee-net EV. Fails out-of-sample; off.
 
-③ REWARD FARM  [t_rem > 60s]   delta-neutral, leaderboard Group C
-   Two-sided quotes within rewardsMaxSpread of mid at ≥ rewardsMinSize ($50).
-   Trade PnL ≈ 0 by design; return is the liquidity-rewards pool + maker rebates.
+③ REWARD FARM  [t > 60s]                       NO-OP on 5-min (rewards.rates=null)
+   Two-sided delta-neutral quotes. Only earns on EVENT markets with a funded pool.
 
-   CLOSEOUT [t_rem < 45s] — no new positions. We do NOT snipe the last seconds;
-   latency loss to co-located bots is unwinnable.
+★ CERTAINTY / FEED-LAG  [10s ≤ t ≤ 220s]       PAPER-ONLY, the validated edge
+   Isolated shadow read of the computed signal (NOT in the elif dispatch, so it can neither
+   preempt nor be preempted). Fires the confident side iff:
+     p_side ≥ CERTAINTY_FLOOR (0.80)                     — model is sure
+     AND |distance_bp| ≥ CERTAINTY_MIN_MOVE_BP (5bp)     — oracle already moved (Window Delta)
+     AND ask ≤ p_side − CERTAINTY_LAG_MARGIN (0.03)      — book still underprices it (the lag)
+     AND ask ≤ CERTAINTY_MAX_ASK (0.97) AND spread ≤ MAX_SPREAD AND fee-net EV ≥ 0
+   Size: $25 base, $50 in the late slice (t ≤ CERTAINTY_LATE_FROM=45), capped $50.
+   Records leg='CERTAINTY', resolved against the REAL outcome in _resolve_cert_shadow.
+
+BOX EXIT  — open positions can hedge into a $1 box (BOX_STOP_*). Selection bias, not edge;
+   under realistic-fill stress.
 ```
 
-Positions resolve on the **real** Polymarket outcome (fetched from the resolved event),
-never a Binance proxy. Reward/arb P&L is accrued separately (`state.add_reward/add_arb_pnl`).
-Live execution of the farm/arb legs (SPLIT/MERGE, two-sided order management) is the next round.
+`LATE_MOMENTUM` is a separate experimental paper shadow (`LATE_MOMENTUM_ENABLED=False` by default).
 
 ---
 
 ## Probability Model — driftless random-walk barrier (`signal_engine.barrier_p_up`)
 
 ```
-σ_price = S · σ_ret · √t_remaining           # σ_ret = realized per-second return vol
-σ_total = √( σ_price² + (k · S · basis_bp/1e4)² )   # widen for CEX disagreement
-P(Up)   = Φ( (S − ref + drift) / σ_total )   # drift ≈ 0 (DRIFT_WEIGHT default 0)
+σ_price = S · σ_ret · VOL_MULT · √t_remaining          # σ_ret = realized per-second return vol
+σ_total = √( σ_price² + (BASIS_VOL_INFLATE · S · basis_bp/1e4)² )   # widen for CEX disagreement
+P(Up)   = Φ( (S − ref + drift) / σ_total )             # drift ≈ 0 (DRIFT_WEIGHT = 0)
 ```
 
-This is the correct closed form for "will price be ≥ ref after t seconds" and is
-**calibratable** via `backtest.py` (Brier score + calibration table + `--sweep` over σ).
+`VOL_MULT=0.5` (recalibrated 2026-06-19 on 8,044 REAL-resolved windows; best Brier 0.155–0.163 on all
+three assets — the old 0.7 was tuned on 258 windows and was over-dispersed). The model is good *signal*
+(monotonic, sub-coin-flip Brier) but its only profitable *use* is identifying the genuine
+high-certainty / feed-lag states the certainty gate trades — NOT a bare directional bet.
 
-**Trade gating is expected-value, not a flat cent edge** (`pricing.py`):
-- `taker_ev_per_share(p, ask) = (p − ask) − 0.07·ask·(1−ask)` ; trade if `≥ MIN_EV_TAKER`.
-- `maker_ev_per_share(p, px)  = (p − px) + rebate(px) − haircut` ; quote if `≥ MIN_EV_MAKER`.
-
-A flat threshold is wrong because the fee is largest at 50¢ and ~0 at the extremes —
-EV gating naturally avoids the coin-flip zone and allows thinner edges when confident.
+Trade gating is fee-net **expected value**, not a flat cent edge (`pricing.py`):
+`taker_ev_per_share(p, ask) = (p − ask) − 0.07·ask·(1−ask)`. The fee peaks at 50¢ and ~0 at the
+extremes, so EV gating naturally avoids the coin-flip zone — which is exactly where bare directional
+prediction bled.
 
 ---
 
@@ -176,51 +156,71 @@ EV gating naturally avoids the coin-flip zone and allows thinner edges when conf
 ```
 Binance WS (aggTrade)  ──┐
 Coinbase WS (ticker)   ──┼── oracle_feed.Oracle (blend + basis + vol)
-                          │           │
-Polymarket CLOB WS (book)─┘   signal_engine.py ──(pricing.py EV)── executor.py ── CLOB
+Chainlink RTDS WS      ──┘           │
+                                      │
+Polymarket CLOB WS (book)─── signal_engine.py ──(pricing.py EV)── executor.py ── CLOB
                                           │
-                                      risk.py · state.py (SQLite: signals/positions/ticks/outcomes)
+                                      risk.py · state.py (SQLite: signals/positions/ticks/outcomes/trades)
                                           │
                                       dashboard_server.py → dashboard/index.html
-                                      backtest.py (offline, reads ticks+outcomes)
+                                      backtest.py (offline: calibration, taker, certainty)
 ```
 
 | File | Role |
 |---|---|
 | `config.py` | All constants; `ASSETS` + `ASSET_PARAMS` (per-asset feeds/slugs/titles) |
-| `binance_feed.py` | Binance WS per asset, rolling price, 15s momentum, realized vol |
-| `oracle_feed.py` | Coinbase + Chainlink-RTDS WS per asset + `Oracle`: settlement price, CEX basis, vol |
-| `polymarket_book.py` | CLOB WS per asset, local bid/ask book, PING heartbeat, reconnect re-subscribe |
-| `market_discovery.py` | Per-asset slug → event fetch; token IDs, timing, reward params, **real resolution** |
-| `signal_engine.py` | `barrier_p_up` model, `FairValueModel`, 3-leg strategy (arb/taker/farm) |
-| `pricing.py` | Fee, EV, `pair_arb_edge`, farm-reward estimate (single source of truth) |
-| `executor.py` | Per-asset: IOC taker, `execute_arb`, `run_farm`, `box_position`. Paper = log only |
+| `binance_feed.py` | Binance WS per asset; rolling price, 15s momentum, realized vol |
+| `oracle_feed.py` | Coinbase + Chainlink-RTDS WS per asset + `Oracle`: settlement-proxy price, CEX basis, vol |
+| `polymarket_book.py` | CLOB WS per asset; local bid/ask book, PING heartbeat, reconnect re-subscribe, `fill_ask` VWAP depth-walk |
+| `market_discovery.py` | Clock→slug→event fetch; token IDs, timing, reward params, **real resolution** |
+| `signal_engine.py` | `barrier_p_up` model, `FairValueModel`, `evaluate()` legs, `certainty_shadow()` gate |
+| `pricing.py` | Fee, EV, `pair_arb_edge`, reward-score math (single source of truth) |
+| `executor.py` | Per-asset IOC taker, `execute_arb`, `run_farm`, `box_position`. Paper = log only |
 | `risk.py` | Per-asset guard: cooldown + open-position; global daily-loss halt |
-| `state.py` | SQLite (asset-tagged): signals, positions, P&L, **ticks**, **outcomes (PK asset+start_ts)** |
-| `main.py` | `AssetWorker` per asset (1s loop, strike thread, resolution, box-stop) + `BotRunner` aggregator |
-| `backtest.py` | Forward-test: Brier/calibration + taker P&L, per-asset or combined (`--asset`) |
+| `state.py` | SQLite (asset-tagged): signals, positions, P&L, **ticks**, **outcomes (PK asset+start_ts)**, **trades** (shadow legs) |
+| `main.py` | `AssetWorker` per asset (1s loop, strike thread, resolution, certainty shadow, box-stop) + `BotRunner` |
+| `backtest.py` | Calibration (Brier/table), `simulate_taker`, `simulate_certainty` (zone/move parametrised) |
 | `dashboard_server.py` | WebSocket server → pushes JSON state every second |
-| `dashboard/index.html` | POLYDESK dashboard: asset tabs, countdown ring, model-vs-market prob bar, strategy pipeline, EV/arb meters, farm/reward panels, asset-tagged trade log |
+| `dashboard/index.html` | POLYDESK dashboard (asset tabs, pipeline, certainty tally) |
+| `sy/cert_zone_experiment.py` | One-off probe behind the late-zone finding (zone × move grid, OOS split) |
 
 ---
 
 ## Key Config (`config.py`)
 
 ```python
-MAX_STAKE_PER_MARKET = 25      # USDC per window
-MAX_DAILY_LOSS       = 50      # hard halt
-MIN_EV_TAKER         = 0.015   # min fee-net EV/share to fire an IOC taker
-MIN_ARB_EDGE         = 0.005   # min locked $/pair (after both fees) to fire YES/NO arb
-FARM_SIZE_USDC       = 50      # per-side reward-farm size (must clear rewardsMinSize)
-FARM_EST_APR         = 0.40    # paper-only estimate of reward yield on quoted notional
-MAX_SPREAD           = 0.06    # skip if book too wide
-TAKER_ZONE_START/END = 220/45  # taker only fires in this t_remaining band
-REFERENCE_MAX_LAG    = 3       # only trust a strike snapshotted within 3s of T=0
-VOL_WINDOW_SECS      = 45      # realized-vol window (calibrate via backtest.py --sweep)
-DRIFT_WEIGHT         = 0.0     # 0 = driftless (theoretically correct short horizon)
-ADVERSE_SELECTION_HAIRCUT = 0.02  # $/share drag on resting maker EV
-POST_LOSS_COOLDOWN   = 3       # skip N windows after a loss
-CANCEL_OPEN_AT       = 30      # cancel maker quotes at T-30s
+# Risk
+MAX_STAKE_PER_MARKET = 25.0     # USDC per asset-window
+MAX_DAILY_LOSS       = 50.0     # global hard halt
+MAX_OPEN_POSITIONS   = 1        # per asset
+
+# Bare directional taker — DISABLED (fails OOS)
+DIRECTIONAL_TAKER_ENABLED = False
+MIN_EV_TAKER  = 0.03 ; MIN_TAKER_ENTRY = 0.72   # only relevant if re-enabled
+TAKER_ZONE_START/END = 220/45
+
+# Model
+VOL_MULT = 0.5                  # recalibrated on 8,044 windows
+DRIFT_WEIGHT = 0.0 ; BASIS_VOL_INFLATE = 1.0
+REFERENCE_MAX_LAG = 3           # trust a strike only within 3s of T=0
+
+# CERTAINTY / FEED-LAG gate (the validated edge — PAPER ONLY)
+CERTAINTY_SHADOW_ENABLED = True
+CERTAINTY_FLOOR      = 0.80     # model must be this sure
+CERTAINTY_LAG_MARGIN = 0.03     # book must underprice by this much
+CERTAINTY_MAX_ASK    = 0.97
+CERTAINTY_ZONE_START/END = 220/10   # extended to T-10s (edge concentrated in the late slice)
+CERTAINTY_MIN_MOVE_BP = 5.0     # Window-Delta gate: oracle must already have moved
+CERTAINTY_LATE_FROM  = 45       # ≤ this t_remaining ⇒ late-slice sizing
+CERTAINTY_SIZE_USDC  = 25.0 ; CERTAINTY_LATE_SIZE_USDC = 50.0 ; CERTAINTY_MAX_SIZE_USDC = 50.0
+
+# Box exit (selection-bias hedge, under realistic-fill stress)
+BOX_STOP_ENABLED = True ; BOX_STOP_MARGIN_LOSS = 0.10 ; BOX_STOP_MARGIN_PROFIT = 0.20
+PAPER_FILL_REALISM = True ; PAPER_SLIPPAGE_TICKS = 1
+
+# Dead-on-5m legs (kept for event markets / safety)
+FARM_ENABLED = True             # no-op when rewards.rates=null (always, on 5-min)
+ARB_ENABLED  = True ; MIN_ARB_EDGE = 0.005
 ```
 
 ---
@@ -229,15 +229,16 @@ CANCEL_OPEN_AT       = 30      # cancel maker quotes at T-30s
 
 | Stream | URL | Auth |
 |---|---|---|
-| Binance trades | `wss://stream.binance.com:9443/ws/<btc\|eth\|sol>usdt@aggTrade` (1 socket/asset) | None |
-| Coinbase trades | `wss://ws-feed.exchange.coinbase.com` (ticker, `<BTC\|ETH\|SOL>-USD`, 1 socket/asset) | None |
-| Chainlink RTDS | `wss://ws-live-data.polymarket.com` (`crypto_prices_chainlink`, `<btc\|eth\|sol>/usd`, 1 socket/asset) | None |
-| Polymarket book | `wss://ws-subscriptions-clob.polymarket.com/ws/market` (1 socket/asset) | None |
+| Binance trades | `wss://stream.binance.com:9443/ws/<btc\|eth\|sol>usdt@aggTrade` (1/asset) | None |
+| Coinbase trades | `wss://ws-feed.exchange.coinbase.com` (ticker, `<BTC\|ETH\|SOL>-USD`, 1/asset) | None |
+| Chainlink RTDS | `wss://ws-live-data.polymarket.com` (`crypto_prices_chainlink`, `<btc\|eth\|sol>/usd`, 1/asset) | None |
+| Polymarket book | `wss://ws-subscriptions-clob.polymarket.com/ws/market` (1/asset) | None |
 | CLOB REST | `https://clob.polymarket.com` | HMAC L2 |
 | Gamma events | `https://gamma-api.polymarket.com/events?slug=<btc\|eth\|sol>-updown-5m-<ts>` | None |
 
-Heartbeats: Binance reconnects every 24h (listen for `serverShutdown`). Polymarket needs
-`PING` every 10s or drops, and `polymarket_book` re-subscribes on every (re)connect.
+Heartbeats: Polymarket needs `PING` every 10s or drops, and `polymarket_book` re-subscribes on every
+(re)connect (a 2nd subscription on the same socket is silently ignored — proven bug, now reconnect
+per window).
 
 ---
 
@@ -246,73 +247,68 @@ Heartbeats: Binance reconnects every 24h (listen for `serverShutdown`). Polymark
 ```bash
 pip install -r requirements.txt
 cp .env.example .env                    # no keys needed for paper mode
-python3 main.py --mode paper            # all of config.ASSETS (BTC,ETH,SOL); dashboard :8000
-python3 main.py --mode paper --assets BTC,ETH   # subset
-python3 backtest.py --sweep             # calibrate σ on recorded data (all assets)
-python3 backtest.py --asset ETH         # per-asset calibration/P&L
-python3 main.py --mode live             # requires PRIVATE_KEY + CLOB_API_KEY in .env
+python3 main.py --mode paper            # all of config.ASSETS; dashboard WS :8888 / HTTP :8000
+python3 main.py --mode paper --assets BTC,ETH
+python3 backtest.py --db <recovered.db> --certainty   # the validated leg's P&L / OOS / sweep
+python3 backtest.py --db <recovered.db> --sweep        # calibrate σ (Brier/calibration table)
+python3 backtest.py --asset ETH --buckets              # per-asset entry-bucket P&L
+python3 main.py --mode live             # requires PRIVATE_KEY + CLOB_API_KEY; see warning below
 ```
 
-Note: on a laptop, OS sleep stalls every feed and windows get flagged MISSED (correct
-behaviour — never trade a window whose open you didn't see). Run on a VPS, or keep the
-machine awake (`caffeinate -dims`) for unattended paper recording.
+> **⚠ Live mode is intentionally quiet.** With `DIRECTIONAL_TAKER_ENABLED=False` and the certainty
+> leg paper-only, `--mode live` places **no real directional orders by design** — the only validated
+> edge is not yet cleared for capital. This is correct per the Paper→Live Checklist. Run **paper** to
+> see the certainty leg fire (~44% of windows) and accumulate depth-realistic fills.
 
-Note: `python3` (not `python`) on this machine. Live execution is intentionally NOT
-hardened yet (foundation round) — prove edge in paper first.
+Note: on a laptop, OS sleep stalls every feed and windows get flagged `MISSED` (correct — never trade
+a window whose open you didn't see). Run on a VPS or `caffeinate -dims`. `python3` (not `python`).
 
-### Unattended VPS run (the supported way to record a clean week)
+### Unattended VPS run
 
 ```bash
 tmux new -s polybot './run.sh'          # supervisor: auto-restarts on crash/OOM
-#   …or install the systemd unit:
 sudo cp polybot.service /etc/systemd/system/ && sudo systemctl enable --now polybot
 ssh -L 8000:localhost:8000 user@vps     # view the dashboard privately (host stays 127.0.0.1)
-# Hourly SAFE snapshot (never `cp` a live WAL DB — that corrupts the copy):
 (crontab -l; echo "0 * * * * cd ~/PolymarketBot && python3 backup_db.py --keep 48") | crontab -
 ```
 
-The bot now **quarantines a corrupt `bot_state.db` on startup** (renames it
-`*.corrupt.<ts>` and starts fresh) and runs an **hourly prune + WAL checkpoint** so a
-multi-day session stays bounded and crash-safe (`synchronous=NORMAL` + WAL).
+The bot quarantines a corrupt `bot_state.db` on startup and runs an hourly prune + WAL checkpoint
+(`synchronous=NORMAL` + WAL) so a multi-day session stays bounded and crash-safe. **Never `cp` a live
+WAL DB** — that corrupts the copy (it's how the `ticks`/`signals` tables were corrupted once; recovered
+via `sqlite3 .recover`).
 
-### Paper-fill realism (`config.PAPER_FILL_REALISM`, default ON)
-
-Paper taker/box fills now walk the **real displayed ask depth (VWAP)** + one adverse tick
-of latency slippage, instead of assuming the full stake fills at the touch. A box that
-can't fully hedge within `BOX_MAX_FILL_SLIPPAGE` of the touch is **skipped** (the position
-rides to resolution) — so the recorded box P&L is one we could actually capture. Set
-`PAPER_FILL_REALISM=False` to reproduce the old optimistic ledger for comparison.
-
-> **Open question this week answers:** the recorded directional taker leg is net-negative
-> on all three assets (BTC −$823 / ETH −$250 / SOL −$705 on raw WIN−LOSS); the hedge-to-box
-> exit is what makes the system positive. Re-run `backtest.py --validate --asset …` after a
-> few days of realistic-fill data to confirm the box edge survives real liquidity.
+> **If the bot is "barely trading" on the VPS:** check the logs for repeated `"Bot started"` and the
+> now-`WARNING`-level `strike MISSED (... oracle.connected=...)` line. A "no price feed" reason within
+> 3s of T=0 means feeds were dead at the boundary — almost always the process restarting at window
+> opens. A missed strike voids the window for **every** leg (all gate on `has_reference`).
 
 ---
 
 ## Paper → Live Checklist
 
-- [ ] ≥ 300 windows of recorded `ticks` + resolved `outcomes` **per asset**
-- [ ] **Model calibrated per asset**: Brier < 0.25 and a flat calibration table
-      (`backtest.py --asset BTC/ETH/SOL` — vol dynamics differ; don't assume BTC's
-      VOL_MULT transfers until each asset's table is flat)
-- [ ] Profit factor ≥ 1.5 and positive EV/trade on the taker leg (per asset)
+- [ ] ≥ 300 windows of fresh (post-2026-06-21) recorded `ticks` + resolved `outcomes` **per asset**
+- [ ] **Certainty leg PF ≥ 1.5 on depth-realistic paper fills** (real book VWAP, not top-of-book) —
+      the live run is the only thing that measures the depth-walk the backtest could not
+- [ ] Model calibrated per asset: Brier < 0.25 and a flat calibration table (`--asset`, `--buckets`)
 - [ ] Edge survives the real CEX→Chainlink basis (it is in the recorded data)
+- [ ] Strike snapshot verified within `REFERENCE_MAX_LAG` of T=0 (no `MISSED` windows traded)
 - [ ] Both WebSocket reconnects tested (book re-subscribes, feeds recover)
-- [ ] Strike snapshot verified within REFERENCE_MAX_LAG of T=0 (no MISSED windows traded)
-- [ ] Live order path (fills/partials/settlement) hardened — separate round
+- [ ] Live order path (fills/partials/settlement, slippage guard) hardened — separate round
+- [ ] **Only then** flip the certainty leg from paper to live capital, with Kelly-bounded sizing
 
 ---
 
 ## Legal
 
-Polymarket is geo-restricted. Verify jurisdiction. Start with ≤$50 USDC. Fee structure may change — call `getClobMarketInfo()` before each session.
+Polymarket is geo-restricted. Verify jurisdiction. Start with ≤$50 USDC. Fee structure may change —
+call `getClobMarketInfo()` before each session.
 
 ---
 
 ## References
 
 - [Polymarket CLOB Docs](https://docs.polymarket.com/developers/CLOB/introduction) · [Maker Rebates](https://docs.polymarket.com/developers/market-makers/maker-rebates-program)
-- [How BTC 5-Min Scalpers Work (May 2026)](https://medium.com/mountain-movers/how-btc-5-minute-scalpers-actually-work-on-polymarket-building-the-bot-that-trades-stale-order-a16e84eb3140)
+- [How BTC 5-Min Scalpers Work (Mountain Movers, May 2026)](https://medium.com/mountain-movers/how-btc-5-minute-scalpers-actually-work-on-polymarket-building-the-bot-that-trades-stale-order-a16e84eb3140)
+- [Profitable 5-min bot guide (Benjamin Cup, Substack)](https://benjamincup.substack.com/p/the-ultimate-guide-to-building-a)
 - [Polymarket Dynamic Fees](https://www.financemagnates.com/cryptocurrency/polymarket-introduces-dynamic-fees-to-curb-latency-arbitrage-in-short-term-crypto-markets/)
-- [py_clob_client_v2](https://pypi.org/project/py-clob-client-v2/) · [Binance WS Docs](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams)
+- Internal: `APPROACH.md` (diagnosis + operating plan), `LEADERBOARD_ANALYSIS.md` (wallet evidence)

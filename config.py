@@ -29,7 +29,32 @@ CHAINLINK_RTDS_URL   = "wss://ws-live-data.polymarket.com"
 # Coinbase proxy so the strike is always captured reliably at T=0.
 CHAINLINK_MAX_STALE  = 8
 POLYMARKET_BOOK_WS   = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+# Polymarket's RTDS WebSocket now sits behind Cloudflare bot protection and silently drops
+# a plain client handshake — so we send browser-like headers on connect. (Verified 2026-06-21:
+# a no-header handshake times out; the dashboard CHAINLINK field went blank and every strike
+# fell back to the CEX proxy, which carries a ~4–5bp basis vs the real Price to Beat.)
+RTDS_WS_HEADERS = [
+    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Origin: https://polymarket.com",
+]
+
+# ─── On-chain Chainlink fallback (strike anchor when RTDS is unreachable) ──────────
+# Polymarket settles on Chainlink Data Streams (the RTDS feed above). If that socket is down,
+# the on-chain Chainlink aggregator on Polygon is a far better strike anchor than the CEX proxy
+# (verified 2026-06-21: on-chain BTC/USD $64,079.81 vs real Price to Beat $64,083.33 ≈ 0.5bp,
+# vs the proxy's ~4.5bp). It updates on a heartbeat (~13–40s), so it is used only as a fallback.
 POLYGON_RPC          = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
+# Fallback list tried in order (the default public RPC is sometimes gated):
+CHAINLINK_RPC_URLS = [u for u in [os.getenv("POLYGON_RPC", "")] if u] + [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.llamarpc.com",
+    "https://polygon-rpc.com",
+]
+CHAINLINK_ONCHAIN_ENABLED   = True
+CHAINLINK_ONCHAIN_POLL_SECS = 12     # heartbeat poll cadence
+CHAINLINK_ONCHAIN_MAX_STALE = 90     # accept an on-chain price only if updatedAt within this
 
 # ─── Market Target (multi-asset) ───────────────────────────────────────────────
 # 5-min markets are Gamma *events* with slug  "<asset>-updown-5m-<start_unix_ts>",
@@ -39,18 +64,23 @@ POLYGON_RPC          = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
 MARKET_WINDOW_SECS   = 300                    # 5 minutes
 
 ASSET_PARAMS = {
+    # chainlink_agg = Chainlink price-feed aggregator on Polygon (on-chain strike fallback).
     "BTC": {"name": "Bitcoin",  "binance_symbol": "btcusdt",
             "coinbase_product": "BTC-USD", "chainlink_symbol": "btc/usd",
+            "chainlink_agg": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
             "slug_prefix": "btc-updown-5m-", "title_pattern": "Bitcoin Up or Down"},
     "ETH": {"name": "Ethereum", "binance_symbol": "ethusdt",
             "coinbase_product": "ETH-USD", "chainlink_symbol": "eth/usd",
+            "chainlink_agg": "0xF9680D99D6C9589e2a93a78A04A279e509205945",
             "slug_prefix": "eth-updown-5m-", "title_pattern": "Ethereum Up or Down"},
     "SOL": {"name": "Solana",   "binance_symbol": "solusdt",
             "coinbase_product": "SOL-USD", "chainlink_symbol": "sol/usd",
+            "chainlink_agg": "0x10C8264C0935b3B9870013e057f330Ff3e9C56dC",
             "slug_prefix": "sol-updown-5m-", "title_pattern": "Solana Up or Down"},
     # XRP exists too (xrp-updown-5m-) — add to ASSETS when desired.
     "XRP": {"name": "XRP",      "binance_symbol": "xrpusdt",
             "coinbase_product": "XRP-USD", "chainlink_symbol": "xrp/usd",
+            "chainlink_agg": "0x785ba89291f676b5386652eB12b30cF361020694",
             "slug_prefix": "xrp-updown-5m-", "title_pattern": "XRP Up or Down"},
 }
 

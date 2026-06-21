@@ -212,7 +212,7 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
           <div class="sp"><div class="k">Coinbase</div><div id="px-coinbase" class="v">—</div></div>
           <div class="sp"><div class="k">Binance</div><div id="px-binance" class="v">—</div></div>
         </div>
-        <div class="k" style="margin-top:6px;color:var(--ink-4);font-size:9px">*Chainlink = the feed Polymarket settles on (Price to Beat). Sparse; we use it when fresh, else the CEX proxy.</div>
+        <div class="k" style="margin-top:6px;color:var(--ink-4);font-size:9px">*Chainlink = the feed Polymarket settles on (Price to Beat). Strike source: RTDS Data-Streams → on-chain Chainlink (Polygon) → CEX proxy. Proxy = ~4-5bp basis risk (shown on the strike chip).</div>
       </div>
       <div class="pane">
         <div class="cap">Settlement Model <span class="chip" id="strike-chip">strike —</span></div>
@@ -413,13 +413,17 @@ function render(d){
   set('oracle-price',btc.price?'$'+commas(btc.price):'—','bigprice num '+((btc.distance_bp||0)>=0?'up':'down'));
   set('px-binance',btc.binance?'$'+commas(btc.binance):'—','v num');
   set('px-coinbase',btc.coinbase?'$'+commas(btc.coinbase):'—','v num');
-  set('px-chainlink',btc.chainlink?'$'+commas(btc.chainlink):'—','v num '+(btc.chainlink?'':'muted'));
+  const ssrc=btc.strike_source;                         // rtds | onchain | proxy
+  const clok=btc.chainlink&&ssrc!=='proxy';
+  set('px-chainlink',btc.chainlink?'$'+commas(btc.chainlink):'—','v num '+(clok?'':'muted'));
   set('basis-chip',btc.basis_bp!=null?'basis '+f(btc.basis_bp,1)+'bp':'basis —','chip');
 
-  // model
+  // model — strike chip reflects WHERE the strike came from (proxy = basis risk)
   const stk=mk.strike_status;
-  const stkc={CAPTURED:['strike ✓ live','chip ok'],MISSED:['strike MISSED','chip bad'],
+  let stkc={CAPTURED:['strike ✓ live','chip ok'],MISSED:['strike MISSED','chip bad'],
             PENDING:['strike …','chip wait'],NONE:['strike —','chip']}[stk]||['strike —','chip'];
+  if(stk==='CAPTURED'&&ssrc) stkc = ssrc==='rtds' ? ['strike ✓ chainlink','chip ok']
+        : ssrc==='onchain' ? ['strike ✓ on-chain','chip ok'] : ['strike ⚠ CEX proxy','chip wait'];
   set('strike-chip',stkc[0],stkc[1]);
   set('m-ref',mk.reference_price?'$'+commas(mk.reference_price):'—','v num '+(mk.reference_price?'':'muted'));
   const dist=btc.distance_bp;

@@ -15,6 +15,7 @@ Usage:
 import argparse
 import time
 import threading
+from typing import Optional
 from loguru import logger
 
 import config
@@ -74,6 +75,7 @@ class AssetWorker:
         self._last_signal = None
         self._current_window_id: str = ""
         self._refs: dict[int, float] = {}        # start_ts -> snapshotted strike
+        self._ref_source: dict[int, str] = {}    # start_ts -> strike source (rtds|onchain|proxy)
         self._missed: set[int] = set()           # windows we caught too late to strike
         self._ref_lock = threading.Lock()        # guards _refs/_missed (strike thread + loop)
         self._pending: dict[int, str] = {}       # start_ts -> condition_id awaiting resolution
@@ -389,9 +391,18 @@ class AssetWorker:
             lag = time.time() - start_ts
             px = self.oracle.price
             if px and px > 0 and lag <= config.REFERENCE_MAX_LAG:
+                src = self.oracle.strike_source            # rtds | onchain | proxy
                 self._refs[start_ts] = px
-                logger.debug(f"[{self.asset}] Reference snapshot for {start_ts}: "
-                             f"{px:.2f} (lag {lag:.1f}s)")
+                self._ref_source[start_ts] = src
+                if src == "proxy":
+                    # The strike is a CEX proxy (~4-5bp basis vs the real Chainlink Price to
+                    # Beat) because BOTH Chainlink sources were stale at T=0. Visible warning:
+                    # the directional/certainty edge depends on an accurate strike.
+                    logger.warning(f"[{self.asset}] Strike {start_ts} from CEX PROXY "
+                                    f"(both Chainlink feeds stale) {px:.2f} — basis risk")
+                else:
+                    logger.debug(f"[{self.asset}] Reference snapshot for {start_ts}: "
+                                 f"{px:.2f} src={src} (lag {lag:.1f}s)")
             elif lag > config.REFERENCE_MAX_LAG:
                 reason = "no price feed" if not (px and px > 0) else f"lag {lag:.1f}s"
                 self._missed.add(start_ts)
@@ -679,7 +690,8 @@ class AssetWorker:
             },
             "px": {
                 "price": round(self.oracle.price, 4),
-                "chainlink": round(self.oracle.chainlink.current_price, 4),
+                "chainlink": round(self.oracle.chainlink_price, 4),
+                "strike_source": self.oracle.strike_source,
                 "binance": round(self.binance.current_price, 4),
                 "coinbase": round(self.oracle.coinbase.current_price, 4),
                 "basis_bp": round(self.oracle.cex_basis_bp, 2),
@@ -720,8 +732,25 @@ class AssetWorker:
                 "cert_shadow_open": len(self._cert_shadow),
                 "cert_shadow_session": round(self._cert_shadow_session, 2),
             },
-            "position": state.get_open_position(self.asset),
+            "position": state.get_open_position(self.asset) or self._open_cert_position(),
             "risk_status": self.risk.status_str(),
+        }
+
+    def _open_cert_position(self) -> Optional[dict]:
+        """Surface an OPEN certainty/feed-lag shadow as the dashboard position. The cert leg
+        is a paper shadow (no real `positions` row), so without this the trade log shows OPEN
+        while the OPEN POSITION panel says 'No open position'. Cert shadows are popped on
+        resolution, so anything left in _cert_shadow is genuinely live."""
+        if not self._cert_shadow:
+            return None
+        start_ts = max(self._cert_shadow)          # most recent open shadow
+        cs = self._cert_shadow[start_ts]
+        px = cs.get("price") or 0.0
+        return {
+            "side": cs.get("side"),
+            "entry_price": px,
+            "size_usdc": round((cs.get("shares") or 0.0) * px, 2),
+            "order_type": "CERTAINTY",
         }
 
 
