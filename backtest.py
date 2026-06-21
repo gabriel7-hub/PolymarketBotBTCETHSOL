@@ -149,7 +149,9 @@ def simulate_taker(rows, vol_mult: float, min_ev: float = None):
 
 def simulate_certainty(rows, vol_mult: float, certainty_floor: float = 0.80,
                        lag_margin: float = 0.03, max_ask: float = 0.97,
-                       min_ev: float = 0.0, slippage: float = 0.0):
+                       min_ev: float = 0.0, slippage: float = 0.0,
+                       zone_end: float = None, zone_start: float = None,
+                       min_move_bp: float = None):
     """
     APPROACH.md §3① — buy NEAR-CERTAIN outcomes the book hasn't repriced yet.
 
@@ -170,6 +172,11 @@ def simulate_certainty(rows, vol_mult: float, certainty_floor: float = 0.80,
     VWAP depth-walk over the ladder (the other half of live realism) cannot be reproduced from
     this data and is NOT captured.
     """
+    # Gate bounds default to the live certainty config (the leg these numbers govern).
+    ze = config.CERTAINTY_ZONE_END if zone_end is None else zone_end
+    zs = config.CERTAINTY_ZONE_START if zone_start is None else zone_start
+    mb = config.CERTAINTY_MIN_MOVE_BP if min_move_bp is None else min_move_bp
+
     by_window: dict[tuple, list] = {}
     for r in rows:
         by_window.setdefault(_wkey(r), []).append(r)
@@ -179,7 +186,11 @@ def simulate_certainty(rows, vol_mult: float, certainty_floor: float = 0.80,
         winning = ticks[0]["winning_side"]
         for r in sorted(ticks, key=lambda x: -x["t_remaining"]):
             t = r["t_remaining"]
-            if not (config.TAKER_ZONE_END <= t <= config.TAKER_ZONE_START):
+            if not (ze <= t <= zs):
+                continue
+            # Window-Delta gate: oracle must already have moved >= mb bp from the strike.
+            ref = r["ref_price"] or 0
+            if ref > 0 and abs((r["oracle_price"] or 0) - ref) / ref * 1e4 < mb:
                 continue
             p = _p_up(r, vol_mult)
             up_ask, dn_ask = r["up_ask"], r["down_ask"]

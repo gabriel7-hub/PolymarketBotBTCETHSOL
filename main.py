@@ -301,12 +301,13 @@ class AssetWorker:
                         and start_ts not in self._cert_shadow):
                     pick = self.engine.certainty_shadow(signal)
                     if pick is not None:
-                        cside, cask = pick
+                        cside, cask, csize = pick
                         # Depth-realistic fill: DECIDE on the displayed ask, FILL by walking
                         # the live book (VWAP) + one adverse latency tick — the very realism
                         # the backtest could not model from top-of-book ticks. A too-thin /
                         # empty ask book means no fill (we don't manufacture liquidity).
-                        entry, shares = cask, config.CERTAINTY_SIZE_USDC / cask
+                        # csize = confidence-scaled paper notional (late slice gets more).
+                        entry, shares = cask, csize / cask
                         if config.PAPER_FILL_REALISM and self.book is not None:
                             tick = float(getattr(window, "tick_size", None) or config.TICK_SIZE)
                             filled, vwap = self.book.fill_ask(cside, shares)
@@ -394,8 +395,12 @@ class AssetWorker:
             elif lag > config.REFERENCE_MAX_LAG:
                 reason = "no price feed" if not (px and px > 0) else f"lag {lag:.1f}s"
                 self._missed.add(start_ts)
-                logger.debug(f"[{self.asset}] Window {start_ts} strike MISSED ({reason}) "
-                             f"— will not trade")
+                # WARNING (not debug) so the root cause is visible in production logs: a
+                # "no price feed" reason means oracle.price==0 within REFERENCE_MAX_LAG of T=0,
+                # which almost always means feeds were down at the boundary (usually the bot
+                # process restarting at window open). Cross-check against repeating "Bot started".
+                logger.warning(f"[{self.asset}] Window {start_ts} strike MISSED ({reason}, "
+                                f"oracle.connected={self.oracle.connected}) — will not trade")
 
     # ─── Resolution (real outcome from Polymarket) ──────────────────────────────
 

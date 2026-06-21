@@ -94,6 +94,38 @@ for wallet evidence.
   feeds dead at the boundary, which almost always means the BOT PROCESS is restarting (or feeds
   dropping) at window opens. Historical recovered DB captured strikes fine, so this is a NEW runtime
   issue needing the VPS logs to pin (is `"Bot started"` repeating? what's the MISSED reason line?).
+- **2026-06-21 — Late-zone discovery + gate upgrade (the big one).** New probe
+  `sy/cert_zone_experiment.py` (recovered DB, realistic +1-tick fill) shows the certainty/feed-lag
+  edge is **concentrated in the last 10–45s**, not the mid-window — overturning the "never trade the
+  last 45s" doctrine *for this leg* (we're not racing a new move, we're buying a favorite whose ask
+  the book left stale into our 1s tick):
+  - zone 45..220s: PF **1.14** / EV $0.68 (below the 1.5 gate, the old config)
+  - zone 10..45s (LATE slice): PF **1.59** / EV $2.03 — **clears the 1.5 gate**
+  - zone 10..45s + window-delta move≥5bp: PF **1.91** / EV $2.51
+  - zone 10..45s + move≥10bp: PF **2.57** / EV $3.18 (n=137, win 92%)
+  - Extending the firing zone to T-10s is OOS-stable (chronological 70/30 TEST +$719 → **+$814**,
+    PF 1.24 → **1.27**). The window-delta move gate is the winners' dominant "Window Delta" signal.
+  - **Shipped (paper-only effect, all gated):** `config.CERTAINTY_ZONE_START/END=220/10`,
+    `CERTAINTY_MIN_MOVE_BP=5`, confidence sizing (`CERTAINTY_LATE_FROM=45`, late notional $50 vs $25
+    base, cap $50). `signal_engine.certainty_shadow` now returns `(side, ask, size)`, gates on the
+    move, and uses the late zone. `backtest.simulate_certainty` parametrised (zone/move) so
+    `--certainty` reflects live. 7-case gate unit-check passes; all modules compile.
+  - **Disabled the live bleed:** `DIRECTIONAL_TAKER_ENABLED=False` — the bare EV taker fails OOS
+    (§1.5b, TEST −$1,140) and was 100% of the −$52 live session; it no longer places orders. The
+    validated directional edge is the certainty leg, not this one.
+  - **Caveats unchanged:** still top-of-book + 1 tick (depth-walk unproven); certainty leg is still
+    PAPER-ONLY by design (no live-capital wiring this round). The paper run now accumulates
+    depth-realistic LATE-zone fills — the exact data needed to clear the 1.5 gate for real capital.
+- **2026-06-21 — P5 rewards contradiction RESOLVED (authoritative).** `getClobMarketInfo` on a live
+  BTC 5m market returns `rewards={'rates': None, 'min_size': 50, 'max_spread': 4.5}`. The pool is
+  **not funded** (`rates: null`) despite the min_size/max_spread fields existing — so the FARM leg
+  correctly earns ~$0 on 5-min markets. `LEADERBOARD_ANALYSIS` read the spread fields as "rewards
+  active"; that's wrong. **Conclusion: drop the farm from the 5-min thesis** (it can only earn on
+  event markets with a funded `rates`). `signal_engine.py:222` was already right to skip.
+- **2026-06-21 — P0 diagnostics:** strike-MISSED reason promoted debug→**warning** (+`oracle.connected`)
+  so the production root cause is visible. Strike *sourcing* left unchanged (Chainlink-vs-Coinbase
+  switch would alter modeled p; needs validation, not a blind edit). Crash-loop root cause still needs
+  VPS logs — check whether `"Bot started"` repeats at window opens.
 - **NEXT:** (a) run paper (`python3 main.py --mode paper`) for a few days at `VOL_MULT=0.5` to
   accumulate live depth-realistic `leg='CERTAINTY'` rows; (b) compare that live shadow P&L vs the
   backtest's +$719 OOS — if the depth-walk doesn't kill it (PF holds, ideally → 1.5), promote to a

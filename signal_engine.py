@@ -200,7 +200,7 @@ class SignalEngine:
         up_sane = up_ask is None or (p_up - up_ask) <= cap
         down_sane = down_ask is None or (p_down - down_ask) <= cap
         spread_ok = up_spread is None or up_spread <= config.MAX_SPREAD
-        if (window.has_reference and spread_ok
+        if (config.DIRECTIONAL_TAKER_ENABLED and window.has_reference and spread_ok
                 and config.TAKER_ZONE_END <= t_rem <= config.TAKER_ZONE_START):
             if (ev_up >= config.MIN_EV_TAKER and up_ask is not None and up_sane
                     and up_ask >= config.MIN_TAKER_ENTRY):
@@ -268,12 +268,20 @@ class SignalEngine:
         signal. Deliberately NOT routed through evaluate()/Action dispatch, so it can neither
         preempt nor be preempted by the real legs — main records it on its own paper ledger.
         Mirrors backtest.simulate_certainty: take the confident side only when the book still
-        underprices it. Returns (side, ask) or None.
+        underprices it. Returns (side, ask, size_usdc) or None.
+
+        Validated 2026-06-21 (sy/cert_zone_experiment.py, recovered 8,044 windows, realistic
+        +1-tick fill): the edge is concentrated in the LAST 10-45s (PF 1.59-2.57, clears the
+        1.5 gate) vs the mid-window (PF 1.14). So the zone is extended to CERTAINTY_ZONE_END
+        (10s) and a window-delta move gate + late-slice sizing are added.
         """
         if not config.CERTAINTY_SHADOW_ENABLED:
             return None
         t = s.time_remaining
-        if not (config.TAKER_ZONE_END <= t <= config.TAKER_ZONE_START):
+        if not (config.CERTAINTY_ZONE_END <= t <= config.CERTAINTY_ZONE_START):
+            return None
+        # Window-Delta gate (winners' dominant signal): the oracle must already have moved.
+        if abs(s.distance_bp) < config.CERTAINTY_MIN_MOVE_BP:
             return None
         floor = config.CERTAINTY_FLOOR
         # p_up + p_down = 1 ⇒ at most one side clears a floor ≥ 0.5 (no coin-flip trades).
@@ -291,7 +299,12 @@ class SignalEngine:
             return None
         if pricing.taker_ev_per_share(p_side, ask) < 0:    # not fee-net positive
             return None
-        return side, ask
+        # Confidence sizing: bump to the late-slice notional inside the validated late zone.
+        size = config.CERTAINTY_SIZE_USDC
+        if t <= config.CERTAINTY_LATE_FROM:
+            size = config.CERTAINTY_LATE_SIZE_USDC
+        size = min(size, config.CERTAINTY_MAX_SIZE_USDC)
+        return side, ask, size
 
     # ─── Two-sided liquidity-reward farm leg ───────────────────────────────────
 

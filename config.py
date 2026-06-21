@@ -88,6 +88,16 @@ MIN_TAKER_ENTRY      = 0.72    # never IOC a side whose ask is below this. RAISE
                                # the bleed but the bare taker still isn't OOS-clean even here; the
                                # real fix is promoting the certainty shadow leg once it survives
                                # depth-realistic paper fills. Revisit with `backtest.py --buckets`.
+
+# Master switch for the BARE directional EV-gated taker (Action.IOC_*). The recovered
+# 8,044-window backtest proved this leg FAILS out-of-sample even at best calibration
+# (TEST −$1,140, PF 0.97 — APPROACH.md §1.5b) and it is the live bleed source (the
+# 2026-06-20 −$52 session was 100% this leg). The validated directional edge is the
+# certainty/feed-lag leg below, not this one. OFF by default: do not place real
+# directional orders on a leg with no OOS edge. (Set True only to reproduce the old
+# behaviour for comparison.)
+DIRECTIONAL_TAKER_ENABLED = False
+
 BOX_STOP_ENABLED     = True    # hedge-to-box stop-loss on the open taker position
 # Box trigger: p_side < 1 − opposite_ask − margin. One margin was doing two opposing
 # jobs, so it is split by what the box would lock (entry + opposite_ask vs $1):
@@ -236,7 +246,32 @@ CERTAINTY_SHADOW_ENABLED = True    # master switch (paper-only effect). False = 
 CERTAINTY_FLOOR      = 0.80        # min model prob for the side to count as "certain"
 CERTAINTY_LAG_MARGIN = 0.03        # min book lag (p_side − ask) required to enter
 CERTAINTY_MAX_ASK    = 0.97        # never buy above this — taker fee eats the edge past here
-CERTAINTY_SIZE_USDC  = 25.0        # paper notional per certainty bet
+CERTAINTY_SIZE_USDC  = 25.0        # base paper notional per certainty bet
+
+# Zone: the certainty edge is CONCENTRATED IN THE LAST 10-45s, not the mid-window. Probe
+# (sy/cert_zone_experiment.py, recovered DB, realistic +1-tick fill, 2026-06-21):
+#   zone 45..220s : PF 1.14 / EV $0.68   (mid-window — below the 1.5 gate)
+#   zone 10..45s  : PF 1.59 / EV $2.03   (LATE slice — CLEARS the 1.5 gate)
+#   zone 10..45s + move>=5bp : PF 1.91 / EV $2.51
+#   zone 10..45s + move>=10bp: PF 2.57 / EV $3.18
+# Extending the gate to fire down to T-10s is also OOS-stable (TEST +$719 -> +$814). This
+# overturns the old "never trade the last 45s" doctrine for THIS leg: we are not racing a new
+# move, we are buying a favorite whose ask the book has left stale (lag persisting into our 1s
+# tick). Still measured top-of-book + 1 tick; the depth-walk is what the live paper run proves.
+CERTAINTY_ZONE_START = 220         # secs remaining: gate may start at/below this
+CERTAINTY_ZONE_END   = 10          # secs remaining: gate stops at/below this (extended 45->10)
+
+# Window-Delta gate (the winners' DOMINANT signal): only fire when the oracle has ALREADY
+# moved >= this many bp from the strike. Raises win%/PF (late slice 1.59 -> 1.91 at 5bp ->
+# 2.57 at 10bp) by skipping the near-boundary windows where the favorite can still flip.
+CERTAINTY_MIN_MOVE_BP = 5.0
+
+# Confidence sizing (P3): in the validated late slice the edge is large and low-variance, so
+# size up there instead of flat $25. Stake = base, bumped to LATE_SIZE inside the late zone
+# when the move gate is strongly cleared. Capped by CERTAINTY_MAX_SIZE_USDC. Paper-only effect.
+CERTAINTY_LATE_FROM   = 45         # secs remaining at/below which "late-slice" sizing applies
+CERTAINTY_LATE_SIZE_USDC = 50.0    # paper notional in the validated late slice
+CERTAINTY_MAX_SIZE_USDC  = 50.0    # hard cap on any single certainty bet
 
 # ─── Fee Constants (Fee Structure V2, effective Mar 30 2026) ───────────────────
 # Crypto taker fee = C × 0.07 × p × (1−p), per share. Makers pay zero.
