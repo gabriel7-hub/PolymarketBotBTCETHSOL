@@ -206,6 +206,8 @@ def simulate_certainty(rows, vol_mult: float, certainty_floor: float = 0.80,
                 continue
             if ask > max_ask:                          # too rich — fee eats the edge
                 continue
+            if ask < config.CERTAINTY_MIN_ASK:         # book disagrees too much — model error, not lag
+                continue
             if (p_side - ask) < lag_margin:            # book hasn't lagged enough — no edge
                 continue
             if pricing.taker_ev_per_share(p_side, ask) < min_ev:

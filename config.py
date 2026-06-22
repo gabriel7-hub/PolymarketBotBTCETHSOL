@@ -276,7 +276,18 @@ CERTAINTY_SHADOW_ENABLED = True    # master switch (paper-only effect). False = 
 CERTAINTY_FLOOR      = 0.80        # min model prob for the side to count as "certain"
 CERTAINTY_LAG_MARGIN = 0.03        # min book lag (p_side − ask) required to enter
 CERTAINTY_MAX_ASK    = 0.97        # never buy above this — taker fee eats the edge past here
+CERTAINTY_MIN_ASK    = 0.82        # never buy BELOW this — see note. Validated 2026-06-22.
 CERTAINTY_SIZE_USDC  = 25.0        # base paper notional per certainty bet
+# CERTAINTY_MIN_ASK: only enter when the BOOK already prices the favorite ≥ this. A large
+# model-vs-book gap (model 0.90 while the book sits near 0.50) is NOT feed-lag — it is model
+# overconfidence against a fairly-priced book, and those entries LOSE under realistic fills.
+# The genuine edge is buying a favorite the book AGREES is a favorite but lags slightly.
+# Validation (recovered bot_state.db, 1,671 REAL windows, realistic +1-tick fill, OOS 70/30):
+#   no floor       : full PF 0.93 / OOS PF 0.92  (net-negative — the live bleed)
+#   ask ≥ 0.82     : full PF 1.07 / OOS PF 1.09-1.18; per-asset BTC 1.18 ETH 1.11 (was 0.70) SOL 0.99
+# Still < the 1.5 live gate, so the leg stays PAPER-ONLY; this only stops the measured bleed.
+# REJECTED by the same validation: a model-vs-book gap CAP (hurt, PF→0.85) and firing only in
+# the last ≤45s (non-monotonic; ≤45s was net-negative here, unlike the older 8,044-window DB).
 
 # Zone: the certainty edge is CONCENTRATED IN THE LAST 10-45s, not the mid-window. Probe
 # (sy/cert_zone_experiment.py, recovered DB, realistic +1-tick fill, 2026-06-21):

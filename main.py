@@ -151,6 +151,7 @@ class AssetWorker:
                 state.update_trade(tr["id"], status="RESOLVED",
                                    outcome=("WIN" if won else "LOSS"),
                                    pnl_usdc=round(pnl, 4), closed_at=time.time())
+                state.add_certainty_pnl(pnl, "WIN" if won else "LOSS")
                 self._cert_shadow_session += pnl
                 healed += 1
             elif time.time() - tr["start_ts"] > stale_after:
@@ -569,6 +570,7 @@ class AssetWorker:
         state.update_trade(cs["trade_id"], status="RESOLVED",
                            outcome=("WIN" if won else "LOSS"),
                            pnl_usdc=round(pnl, 4), closed_at=time.time())
+        state.add_certainty_pnl(pnl, "WIN" if won else "LOSS")
         self._cert_shadow_session += pnl
         logger.info(f"[PAPER·SHADOW][{self.asset}] certainty {cs['side']} "
                     f"{'WIN' if won else 'LOSS'} pnl={pnl:+.2f} "

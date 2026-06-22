@@ -495,6 +495,17 @@ def add_reward(amount: float):
         """, (_today(), amount, amount))
 
 
+def add_certainty_pnl(pnl: float, outcome: str):
+    """Fold a settled CERTAINTY (feed-lag) shadow trade into the shared daily_summary so it
+    shows in session P&L (today) and total P&L (lifetime sum). The leg is paper-only and lives
+    in the `trades` table, but with the directional taker disabled it is the only operating leg,
+    so its P&L must reach the session/total counters — otherwise both read $0/stale. outcome is
+    'WIN' or 'LOSS' (VOID rows are not counted)."""
+    if outcome not in ("WIN", "LOSS"):
+        return
+    _update_daily(pnl, 0.0, outcome)
+
+
 def add_arb_pnl(amount: float):
     """Record a locked YES/NO arbitrage profit (counts as a winning trade)."""
     with _conn() as conn:
@@ -652,14 +663,16 @@ def get_daily_stats(date_str: Optional[str] = None) -> dict:
 
 def get_asset_day_stats(asset: str) -> dict:
     """
-    Today's taker results for ONE asset, derived from the positions table (the global
-    daily_summary is shared across assets). Used by the dashboard's per-asset tabs.
+    Today's results for ONE asset (the global daily_summary is shared across assets). Used by
+    the dashboard's per-asset tabs. Unions the positions table (real taker/box rows) with the
+    settled CERTAINTY shadow rows in `trades` — with the directional taker disabled, certainty
+    is the only operating leg, so a positions-only read showed every asset tab at $0.
     BOXED exits count in net P&L but not in the win/loss denominators.
     """
     import datetime
     midnight = time.mktime(datetime.date.today().timetuple())
     with _conn() as conn:
-        row = conn.execute("""
+        pos = conn.execute("""
             SELECT COUNT(*)                                        AS trades,
                    COALESCE(SUM(pnl_usdc), 0)                      AS net_pnl,
                    COALESCE(SUM(outcome = 'WIN'), 0)               AS wins,
@@ -667,7 +680,21 @@ def get_asset_day_stats(asset: str) -> dict:
             FROM positions
             WHERE asset = ? AND status = 'RESOLVED' AND closed_at >= ?
         """, (asset, midnight)).fetchone()
-        return dict(row)
+        cert = conn.execute("""
+            SELECT COUNT(*)                                        AS trades,
+                   COALESCE(SUM(pnl_usdc), 0)                      AS net_pnl,
+                   COALESCE(SUM(outcome = 'WIN'), 0)               AS wins,
+                   COALESCE(SUM(outcome = 'LOSS'), 0)              AS losses
+            FROM trades
+            WHERE asset = ? AND leg = 'CERTAINTY' AND status = 'RESOLVED'
+                  AND closed_at >= ?
+        """, (asset, midnight)).fetchone()
+        return {
+            "trades":  (pos["trades"]  or 0) + (cert["trades"]  or 0),
+            "net_pnl": (pos["net_pnl"] or 0) + (cert["net_pnl"] or 0),
+            "wins":    (pos["wins"]    or 0) + (cert["wins"]    or 0),
+            "losses":  (pos["losses"]  or 0) + (cert["losses"]  or 0),
+        }
 
 
 def get_overall_stats() -> dict:

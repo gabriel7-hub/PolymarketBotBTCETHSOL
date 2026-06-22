@@ -295,6 +295,8 @@ class SignalEngine:
             return None
         if ask > config.CERTAINTY_MAX_ASK:                 # too rich — fee eats the edge
             return None
+        if ask < config.CERTAINTY_MIN_ASK:                 # book disagrees too much — model error, not lag
+            return None
         if (p_side - ask) < config.CERTAINTY_LAG_MARGIN:   # book hasn't lagged enough
             return None
         if pricing.taker_ev_per_share(p_side, ask) < 0:    # not fee-net positive
