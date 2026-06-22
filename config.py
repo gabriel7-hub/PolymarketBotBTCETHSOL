@@ -77,7 +77,7 @@ ASSET_PARAMS = {
             "coinbase_product": "SOL-USD", "chainlink_symbol": "sol/usd",
             "chainlink_agg": "0x10C8264C0935b3B9870013e057f330Ff3e9C56dC",
             "slug_prefix": "sol-updown-5m-", "title_pattern": "Solana Up or Down"},
-    # XRP exists too (xrp-updown-5m-) — add to ASSETS when desired.
+    # XRP (xrp-updown-5m-) — active since 2026-06-22; 4th asset, paper-only like the rest.
     "XRP": {"name": "XRP",      "binance_symbol": "xrpusdt",
             "coinbase_product": "XRP-USD", "chainlink_symbol": "xrp/usd",
             "chainlink_agg": "0x785ba89291f676b5386652eB12b30cF361020694",
@@ -85,7 +85,7 @@ ASSET_PARAMS = {
 }
 
 # Assets traded this session (env override: ASSETS=BTC,ETH,SOL,XRP).
-ASSETS = [a.strip().upper() for a in os.getenv("ASSETS", "BTC,ETH,SOL").split(",")
+ASSETS = [a.strip().upper() for a in os.getenv("ASSETS", "BTC,ETH,SOL,XRP").split(",")
           if a.strip().upper() in ASSET_PARAMS]
 
 # ─── Risk Limits ───────────────────────────────────────────────────────────────

@@ -648,17 +648,21 @@ def get_daily_pnl(date_str: Optional[str] = None) -> float:
 
 
 def get_daily_stats(date_str: Optional[str] = None) -> dict:
+    """Session (today's) display stats — computed from the raw positions + CERTAINTY rows,
+    NOT the `daily_summary` counter. The counter is an incremental fold that drifts out of
+    sync with the ledgers (a recovered/migrated DB can lose most of the certainty P&L), so the
+    big "Session P&L" number disagreed with the per-asset tabs (which read the raw tables via
+    get_asset_day_stats). Reading the same raw source here keeps Session P&L == sum of the
+    asset tabs. ARB rows are excluded for parity with get_asset_day_stats."""
     import datetime
     if not date_str:
-        date_str = datetime.date.today().isoformat()
+        day = datetime.date.today()
+    else:
+        day = datetime.date.fromisoformat(date_str)
+    since = time.mktime(day.timetuple())
+    until = since + 86400
     with _conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM daily_summary WHERE date = ?", (date_str,)
-        ).fetchone()
-        if row:
-            return dict(row)
-        return {"date": date_str, "trades": 0, "wins": 0, "losses": 0,
-                "gross_profit": 0, "gross_loss": 0, "net_pnl": 0, "rebates": 0}
+        return _pnl_from_ledgers(conn, since=since, until=until, date=day.isoformat())
 
 
 def get_asset_day_stats(asset: str) -> dict:
@@ -697,17 +701,54 @@ def get_asset_day_stats(asset: str) -> dict:
         }
 
 
+def _pnl_from_ledgers(conn, since: Optional[float] = None,
+                      until: Optional[float] = None, date: Optional[str] = None) -> dict:
+    """Aggregate net P&L / trades / wins / losses from the raw ledgers — `positions` (real
+    taker/box rows) UNION the settled `trades` CERTAINTY shadow rows — optionally bounded to
+    [since, until) by closed_at. This is the SAME source the per-asset tabs use
+    (get_asset_day_stats), so totals built from it always reconcile with the tabs. Rebates are
+    pulled from daily_summary (the only place they live) and are ~0 on 5-min markets."""
+    bounds = ""
+    params: list = []
+    if since is not None:
+        bounds += " AND closed_at >= ?"; params.append(since)
+    if until is not None:
+        bounds += " AND closed_at < ?";  params.append(until)
+    agg = """
+        SELECT COUNT(*)                            AS trades,
+               COALESCE(SUM(pnl_usdc), 0)          AS net_pnl,
+               COALESCE(SUM(outcome = 'WIN'), 0)   AS wins,
+               COALESCE(SUM(outcome = 'LOSS'), 0)  AS losses,
+               COALESCE(SUM(CASE WHEN pnl_usdc > 0 THEN pnl_usdc ELSE 0 END), 0) AS gross_profit,
+               COALESCE(SUM(CASE WHEN pnl_usdc < 0 THEN -pnl_usdc ELSE 0 END), 0) AS gross_loss
+        FROM {tbl} WHERE status = 'RESOLVED'{leg}""" + bounds
+    pos = conn.execute(agg.format(tbl="positions", leg=""), params).fetchone()
+    cert = conn.execute(agg.format(tbl="trades", leg=" AND leg = 'CERTAINTY'"), params).fetchone()
+    if date is not None:
+        rb = conn.execute("SELECT COALESCE(rebates,0) r FROM daily_summary WHERE date=?",
+                          (date,)).fetchone()
+        rebates = rb["r"] if rb else 0.0
+    else:
+        rb = conn.execute("SELECT COALESCE(SUM(rebates),0) r FROM daily_summary").fetchone()
+        rebates = rb["r"] if rb else 0.0
+    return {
+        "date": date,
+        "trades":  (pos["trades"]  or 0) + (cert["trades"]  or 0),
+        "net_pnl": (pos["net_pnl"] or 0) + (cert["net_pnl"] or 0),
+        "wins":    (pos["wins"]    or 0) + (cert["wins"]    or 0),
+        "losses":  (pos["losses"]  or 0) + (cert["losses"]  or 0),
+        "gross_profit": (pos["gross_profit"] or 0) + (cert["gross_profit"] or 0),
+        "gross_loss":   (pos["gross_loss"]   or 0) + (cert["gross_loss"]   or 0),
+        "rebates": rebates,
+    }
+
+
 def get_overall_stats() -> dict:
-    """Lifetime totals across every recorded day (taker P&L; rebates/rewards separate)."""
+    """Lifetime totals — computed from the raw ledgers (positions + CERTAINTY), so the UI's
+    Overall P&L reconciles with the per-asset tabs. (Previously summed the `daily_summary`
+    counter, which had drifted ~$1.2k below the ledgers.) Rebates/rewards tracked separately."""
     with _conn() as conn:
-        row = conn.execute("""
-            SELECT COALESCE(SUM(net_pnl), 0)  AS net_pnl,
-                   COALESCE(SUM(rebates), 0)  AS rebates,
-                   COALESCE(SUM(trades), 0)   AS trades,
-                   COALESCE(SUM(wins), 0)     AS wins
-            FROM daily_summary
-        """).fetchone()
-        return dict(row)
+        return _pnl_from_ledgers(conn)
 
 
 def get_recent_signals(limit: int = 50) -> list:

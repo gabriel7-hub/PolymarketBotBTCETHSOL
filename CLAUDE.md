@@ -59,12 +59,13 @@ that walks the real book is what decides it. See Paper→Live Checklist.
 
 ---
 
-## Multi-asset architecture (BTC / ETH / SOL)
+## Multi-asset architecture (BTC / ETH / SOL / XRP)
 
 One **`AssetWorker` per asset** (`main.py`): its own Binance/Coinbase/Chainlink-RTDS feeds, CLOB book
 socket, clock-driven window discovery, signal engine, executor, strike thread and 1s loop — fully
-isolated, so one asset's stall cannot miss another's strike. XRP is defined in `ASSET_PARAMS` but off
-by default. Run subsets via `--assets BTC,ETH` or env `ASSETS=...`.
+isolated, so one asset's stall cannot miss another's strike. **XRP is active since 2026-06-22** (4th
+asset, paper-only like the rest — gathering its own certainty-leg sample). Run subsets via
+`--assets BTC,ETH` or env `ASSETS=...`.
 
 - **Asset-aware schema:** `asset` column on positions/signals/ticks/trades; `outcomes` keyed
   `PRIMARY KEY (asset, start_ts)` (the 300s grid collides across assets). Migration is automatic and
