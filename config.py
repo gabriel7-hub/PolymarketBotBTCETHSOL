@@ -347,7 +347,8 @@ CERTAINTY_BOX_ENABLED     = True
 CERTAINTY_BOX_FROM        = 30     # only consider boxing at/below this t_remaining (edge is here)
 CERTAINTY_BOX_MIN_T       = 2      # too late to model a hedge fill below this t_remaining
 CERTAINTY_BOX_MARGIN_BP   = 1.0    # bet side must be adverse (oracle past strike) by ≥ this
-CERTAINTY_BOX_PERSIST     = 2      # consecutive adverse 1s ticks required (de-noise the oracle)
+CERTAINTY_BOX_PERSIST     = 2      # SECONDS the oracle must stay adverse before boxing (de-noise;
+                                   # time-based so it's invariant to the event-driven loop cadence)
 CERTAINTY_BOX_MAX_OPP_ASK = 0.88   # skip if the hedge is already this rich (late flip — no benefit)
 CERTAINTY_BOX_MAX_TOTAL   = 1.5    # never pay more than this per pair to lock a $1 box
 # Partial boxing — the leaderboard winners (Bonereaper) hedge only ~50% of the position so a false
@@ -391,6 +392,16 @@ DASHBOARD_HOST       = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 # (fine for a localhost/SSH-tunnel-only dashboard).
 DASHBOARD_TOKEN      = os.getenv("DASHBOARD_TOKEN", "")
 STATE_PUSH_INTERVAL  = 1.0     # seconds between dashboard WebSocket pushes
+
+# ─── Event-driven entry latency ────────────────────────────────────────────────
+# The trade loop used to poll every 1s, adding up to ~1000ms between a fresh oracle move and the
+# entry decision. It now WAKES the instant the settlement price moves (RTDS Chainlink / CEX blend,
+# which lead), cutting that to ~FAST_POLL_SEC. Heavy/IO work (DB tick+signal writes, resolution
+# retries, dashboard snapshot) is throttled to HEAVY_MIN_GAP so the faster cadence keeps the SAME
+# ~1Hz data granularity and does NOT bloat the ticks/signals tables. See WINNERS.md §3.
+FAST_POLL_SEC   = 0.05   # price-sampling interval while waiting ≈ worst-case entry latency
+LOOP_MAX_WAIT   = 1.0    # never wait longer than this (heartbeat for discovery/resolution/box)
+HEAVY_MIN_GAP   = 1.0    # min seconds between DB-write / network-retry / snapshot passes
 
 # ─── Data retention (bound DB growth on a long-running host) ────────────────────
 TICK_RETENTION_DAYS  = int(os.getenv("TICK_RETENTION_DAYS", "14"))   # 0 = keep forever

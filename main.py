@@ -95,7 +95,8 @@ class AssetWorker:
         self._cert_shadow_session: float = 0.0   # paper P&L of the certainty shadow leg
         self._box_shadow: dict[int, dict] = {}   # start_ts -> open certainty BOX hedge (shadow)
         self._box_shadow_session: float = 0.0    # cumulative counterfactual P&L impact of boxing
-        self._box_adv_run: dict[int, int] = {}   # start_ts -> consecutive adverse ticks (box de-noise)
+        self._box_adv_run: dict[int, float] = {} # start_ts -> ts the adverse run began (box de-noise)
+        self._last_heavy: float = 0.0            # last DB-write/IO pass (throttle the fast loop to ~1Hz)
         self._last_tick_ts: float = time.time()
         self._farm_reward_session: float = 0.0   # est reward accrued this session
         self._last_farm: dict = {}               # last farm quote details for dashboard
@@ -230,9 +231,19 @@ class AssetWorker:
 
         while not self._stop.is_set():
             try:
+                # The loop now wakes on each fresh oracle tick (~20Hz) for low entry latency, but
+                # DB writes / network retries / the snapshot are throttled to ~1Hz (heavy_due) so the
+                # faster cadence doesn't bloat the ledgers or hammer the CLOB. The latency-critical
+                # path (evaluate → certainty gate → box) runs every wake.
+                now = time.time()
+                heavy_due = (now - self._last_heavy) >= config.HEAVY_MIN_GAP
+                if heavy_due:
+                    self._last_heavy = now
+
                 # The strike is snapshotted by a dedicated high-frequency thread (see
                 # _strike_loop) so it is never missed when this loop stalls on network IO.
-                self._retry_pending_resolutions()
+                if heavy_due:
+                    self._retry_pending_resolutions()
 
                 window = self.discovery.current
                 if not window or not window.is_active:
@@ -267,8 +278,9 @@ class AssetWorker:
 
                 signal = self.engine.evaluate(window)
                 self._last_signal = signal
-                self._record_signal(signal)
-                self._record_tick(signal, window)
+                if heavy_due:                          # keep the ledgers at ~1Hz granularity
+                    self._record_signal(signal)
+                    self._record_tick(signal, window)
 
                 # ── Route the signal to the right execution leg ───────────────
                 now = time.time()
@@ -423,8 +435,11 @@ class AssetWorker:
                         if snap > 0:
                             self._settles[start_ts] = snap
 
-                self._update_snapshot(window=window, signal=signal)
-                time.sleep(1)
+                if heavy_due:
+                    self._update_snapshot(window=window, signal=signal)
+
+                # Wake on the next fresh oracle tick (low entry latency) or after LOOP_MAX_WAIT.
+                self._wait_for_tick(config.LOOP_MAX_WAIT)
 
             except Exception as exc:
                 logger.error(f"[{self.asset}] Main loop error: {exc}", exc_info=True)
@@ -663,6 +678,13 @@ class AssetWorker:
             return
         if start_ts in self._box_shadow:
             return                       # already boxed this window
+        # Cheap timing gate BEFORE the position lookup — the loop now wakes ~20Hz, and the box can
+        # only act inside the last CREDIT_FROM/FROM secs, so skip the per-wake DB read outside it.
+        t = window.time_remaining
+        box_window = (config.CERTAINTY_BOX_CREDIT_FROM if config.CERTAINTY_BOX_CREDIT
+                      else config.CERTAINTY_BOX_FROM)
+        if t > box_window or t < config.CERTAINTY_BOX_MIN_T:
+            return
         # Resolve the protected position.
         #   LIVE: box the REAL open position directly — do NOT depend on the in-memory cert
         #   sentinel (a restart wipes _cert_shadow, which would silently leave an already-open
@@ -684,7 +706,6 @@ class AssetWorker:
             side, entry, shares = cs.get("side"), cs.get("price"), cs.get("shares")
         if not side or not entry or not shares:
             return
-        t = window.time_remaining
         # Opposite side + how far the oracle has moved AGAINST our bet (the resolution variable).
         # distance_bp = (oracle − ref)/ref·1e4 → UP loses when negative, DOWN when positive.
         if side == "UP":
@@ -708,12 +729,14 @@ class AssetWorker:
             if t > config.CERTAINTY_BOX_FROM or t < config.CERTAINTY_BOX_MIN_T:
                 return
             if adverse_bp < config.CERTAINTY_BOX_MARGIN_BP:
-                self._box_adv_run[start_ts] = 0
+                self._box_adv_run.pop(start_ts, None)
                 return
-            run = self._box_adv_run.get(start_ts, 0) + 1
-            self._box_adv_run[start_ts] = run
-            if run < config.CERTAINTY_BOX_PERSIST:
-                return                   # de-noise: require consecutive adverse ticks
+            # De-noise: require the adverse condition to PERSIST for CERTAINTY_BOX_PERSIST seconds.
+            # Time-based (not tick-count) so it is invariant to the now event-driven loop cadence.
+            ts_now = time.time()
+            t0 = self._box_adv_run.setdefault(start_ts, ts_now)
+            if ts_now - t0 < config.CERTAINTY_BOX_PERSIST:
+                return
             if opp_ask >= config.CERTAINTY_BOX_MAX_OPP_ASK:
                 return                   # late flip: hedge already too rich to help — ride it
             kind = "LOSS-CAP"
@@ -833,6 +856,25 @@ class AssetWorker:
             self.risk.on_loss()
         else:
             self.risk.on_push()
+
+    # ─── Event-driven wait ──────────────────────────────────────────────────────
+
+    def _wait_for_tick(self, timeout: float) -> bool:
+        """Block up to `timeout`s, returning as soon as the settlement price moves — so the entry
+        decision reacts within ~FAST_POLL_SEC of a fresh oracle tick (RTDS Chainlink / CEX blend,
+        which lead the book) instead of a fixed 1s poll. Returns True if woken by a price move,
+        False on timeout. Heavy/IO loop work is throttled separately (heavy_due), so this faster
+        cadence does not change the ~1Hz ledger granularity."""
+        deadline = time.time() + timeout
+        last = self.oracle.price
+        while not self._stop.is_set():
+            time.sleep(config.FAST_POLL_SEC)
+            p = self.oracle.price
+            if p > 0 and p != last:
+                return True
+            if time.time() >= deadline:
+                return False
+        return False
 
     # ─── Persistence helpers ────────────────────────────────────────────────────
 
