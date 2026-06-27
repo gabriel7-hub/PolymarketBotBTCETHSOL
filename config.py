@@ -334,6 +334,23 @@ CERTAINTY_LATE_FROM   = 45         # secs remaining at/below which "late-slice" 
 CERTAINTY_LATE_SIZE_USDC = 1.5     # flat $1.5 (late 2x dropped)
 CERTAINTY_MAX_SIZE_USDC  = 1.5     # hard cap on any single certainty bet
 
+# ─── CERTAINTY box-stop (SHADOW: measures the loss-capping hedge, never places it) ──────
+# 2026-06-27. On ~/Downloads/bot_state.db (1759 resolved cert trades) a hedge-to-box on an
+# ORACLE-vs-strike trigger (NOT the model prob — that conceded too late: see
+# certainty-boxing-fails) recovered +$564–$829 OOS-robust on all 4 assets: in the last ~30s,
+# if the bet side is on the WRONG side of the strike, buy the opposite side → locked $1 box.
+# This leg is a pure measurement: it walks the REAL opposite book for a depth-realistic hedge
+# fill and logs a leg='CERTAINTY_BOX' shadow row + a counterfactual "saved" tally, but never
+# places a real order and is excluded from the P&L ledgers. It exists to validate the live
+# hedge fill (the one thing the backtest could not model) before any real-capital hedge.
+CERTAINTY_BOX_ENABLED     = True
+CERTAINTY_BOX_FROM        = 30     # only consider boxing at/below this t_remaining (edge is here)
+CERTAINTY_BOX_MIN_T       = 2      # too late to model a hedge fill below this t_remaining
+CERTAINTY_BOX_MARGIN_BP   = 1.0    # bet side must be adverse (oracle past strike) by ≥ this
+CERTAINTY_BOX_PERSIST     = 2      # consecutive adverse 1s ticks required (de-noise the oracle)
+CERTAINTY_BOX_MAX_OPP_ASK = 0.88   # skip if the hedge is already this rich (late flip — no benefit)
+CERTAINTY_BOX_MAX_TOTAL   = 1.5    # never pay more than this per pair to lock a $1 box
+
 # ─── Fee Constants (Fee Structure V2, effective Mar 30 2026) ───────────────────
 # Crypto taker fee = C × 0.07 × p × (1−p), per share. Makers pay zero.
 TAKER_FEE_RATE       = 0.07    # crypto category coefficient
