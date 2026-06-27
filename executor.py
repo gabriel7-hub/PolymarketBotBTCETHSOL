@@ -331,19 +331,60 @@ class Executor:
 
     def execute_certainty_live(self, signal: Signal, window: MarketWindow,
                                side: str, ask: float, size_usdc: float) -> bool:
-        """LIVE certainty / feed-lag order (live assets only). Places an IOC buy at the touch
-        and opens a REAL position that settles through on_market_resolved() — i.e. it reuses
-        the exact resolution + P&L + risk path as any taker fill. The ledger row is leg='TAKER'
-        (so resolve_taker_ledger settles it) but the detail is tagged CERTAINTY. Returns True
-        if the order was placed."""
+        """LIVE certainty / feed-lag MARKET buy (live assets only). Polymarket requires market
+        BUYs to be denominated in $$$ (MarketOrderArgs.amount, ≤2 decimals) — NOT shares — so
+        we spend `size_usdc` dollars via a FAK (IOC) market order capped at `ask`. Opens a real
+        position settled through on_market_resolved() (ledger row leg='TAKER', detail CERTAINTY).
+        Returns True if the order was accepted."""
+        if not self._client:
+            logger.error(f"[LIVE·CERT][{self.asset}] CLOB client not initialised")
+            return False
         if self._active_pos_id is not None:
             return False                                   # one position per asset-window
         token_id = window.up_token_id if side == "UP" else window.down_token_id
-        price = round(min(config.CERTAINTY_MAX_ASK, ask), 2)
-        logger.warning(f"[LIVE·CERT][{self.asset}] {side} @ {price:.2f} | size=${size_usdc} "
-                       f"| p={signal.p_up if side=='UP' else signal.p_down:.3f} "
-                       f"T-{signal.time_remaining:.0f}s")
-        return self._live_execute(signal, window, side, price, size_usdc, "TAKER", token_id)
+        price  = round(min(config.CERTAINTY_MAX_ASK, ask), 2)   # limit cap for the FAK
+        amount = round(size_usdc, 2)                            # $$$ to spend (≤2 decimals)
+        p_side = signal.p_up if side == "UP" else signal.p_down
+        logger.warning(f"[LIVE·CERT][{self.asset}] {side} MKT spend=${amount} @<={price:.2f} "
+                       f"| p={p_side:.3f} T-{signal.time_remaining:.0f}s")
+        try:
+            from py_clob_client_v2.order_builder.constants import BUY
+            from py_clob_client_v2.clob_types import MarketOrderArgs
+            options = PartialCreateOrderOptions(tick_size=window.tick_size, neg_risk=window.neg_risk)
+            resp = self._client.create_and_post_market_order(
+                MarketOrderArgs(token_id=token_id, amount=amount, side=BUY, price=price),
+                options=options, order_type=OrderType.FAK,
+            )
+            logger.warning(f"[LIVE·CERT][{self.asset}] order resp: {resp}")
+            if not isinstance(resp, dict) or not (resp.get("success", True) and
+                    (resp.get("orderID") or resp.get("orderId") or resp.get("id"))):
+                logger.error(f"[LIVE·CERT][{self.asset}] order NOT accepted: {resp}")
+                return False
+            order_id = resp.get("orderID") or resp.get("orderId") or resp.get("id") or ""
+            # Best-effort fill read; fall back to intended amount @ limit if the resp omits it.
+            made = resp.get("makingAmount") or resp.get("making_amount")   # pUSD spent
+            took = resp.get("takingAmount") or resp.get("taking_amount")   # shares received
+            try:
+                made, took = float(made), float(took)
+                deployed, entry = (made, round(made / took, 4)) if took > 0 else (amount, price)
+            except (TypeError, ValueError):
+                deployed, entry = amount, price
+            pos_id = state.open_position({
+                "asset": self.asset, "market_id": window.condition_id,
+                "market_title": window.market_title, "side": side,
+                "entry_price": entry, "size_usdc": deployed, "order_id": order_id,
+                "order_type": "TAKER", "opened_at": signal.ts,
+            })
+            self._active_order_id   = order_id
+            self._active_pos_id     = pos_id
+            self._active_order_type = "TAKER"
+            self._active_trade_id   = self._ledger_open_taker(window, side, entry, deployed)
+            logger.warning(f"[LIVE·CERT][{self.asset}] FILLED {side} ~${deployed:.2f} "
+                           f"@~{entry:.3f} | order_id={order_id}")
+            return True
+        except Exception as exc:
+            logger.error(f"[LIVE·CERT][{self.asset}] order failed: {exc}")
+            return False
 
     def _live_execute(self, signal: Signal, window: MarketWindow, side: str,
                       price: float, size_usdc: float, order_type: str,
