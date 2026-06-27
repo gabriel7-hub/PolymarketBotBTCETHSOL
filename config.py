@@ -297,7 +297,7 @@ CERTAINTY_FLOOR      = 0.80        # min model prob for the side to count as "ce
 CERTAINTY_LAG_MARGIN = 0.03        # min book lag (p_side − ask) required to enter
 CERTAINTY_MAX_ASK    = 0.97        # never buy above this — taker fee eats the edge past here
 CERTAINTY_MIN_ASK    = 0.82        # never buy BELOW this — see note. Validated 2026-06-22.
-CERTAINTY_SIZE_USDC  = 5.0         # base notional per certainty bet (reduced 25->5 for first live tranche 2026-06-26)
+CERTAINTY_SIZE_USDC  = 1.5         # base notional per certainty bet ($1.5 live tranche 2026-06-27)
 # CERTAINTY_MIN_ASK: only enter when the BOOK already prices the favorite ≥ this. A large
 # model-vs-book gap (model 0.90 while the book sits near 0.50) is NOT feed-lag — it is model
 # overconfidence against a fairly-priced book, and those entries LOSE under realistic fills.
@@ -331,8 +331,8 @@ CERTAINTY_MIN_MOVE_BP = 5.0
 # size up there instead of flat $25. Stake = base, bumped to LATE_SIZE inside the late zone
 # when the move gate is strongly cleared. Capped by CERTAINTY_MAX_SIZE_USDC. Paper-only effect.
 CERTAINTY_LATE_FROM   = 45         # secs remaining at/below which "late-slice" sizing applies
-CERTAINTY_LATE_SIZE_USDC = 5.0     # flat $5 for first live tranche (late 2x dropped 2026-06-26)
-CERTAINTY_MAX_SIZE_USDC  = 5.0     # hard cap on any single certainty bet
+CERTAINTY_LATE_SIZE_USDC = 1.5     # flat $1.5 (late 2x dropped)
+CERTAINTY_MAX_SIZE_USDC  = 1.5     # hard cap on any single certainty bet
 
 # ─── Fee Constants (Fee Structure V2, effective Mar 30 2026) ───────────────────
 # Crypto taker fee = C × 0.07 × p × (1−p), per share. Makers pay zero.
