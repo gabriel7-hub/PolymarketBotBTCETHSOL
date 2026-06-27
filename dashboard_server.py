@@ -51,9 +51,11 @@ def _dumps(snapshot: dict) -> str:
 
 class DashboardServer:
 
-    def __init__(self, state_fn: Callable[[], dict]):
-        """state_fn: returns the current bot state dict; called every push interval."""
+    def __init__(self, state_fn: Callable[[], dict], toggle_fn: Callable[[], bool] = None):
+        """state_fn: returns the current bot state dict; called every push interval.
+        toggle_fn: optional LIVE kill switch; returns the new halted state (True=stopped)."""
         self._state_fn = state_fn
+        self._toggle_fn = toggle_fn
 
     def run(self):
         """Run the server. Blocks the calling thread — call in a daemon thread."""
@@ -71,6 +73,7 @@ class DashboardServer:
         app = web.Application()
         app.router.add_get("/", self._index)
         app.router.add_get("/ws", self._ws)
+        app.router.add_post("/api/live/toggle", self._toggle)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         host = config.DASHBOARD_HOST or "127.0.0.1"
@@ -99,6 +102,19 @@ class DashboardServer:
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache", "Expires": "0",
         })
+
+    async def _toggle(self, request):
+        """LIVE kill switch: flip the bot's live-halt flag. Returns the new state so the
+        button can re-label without waiting for the next snapshot push."""
+        if self._toggle_fn is None:
+            return web.json_response({"error": "no control channel"}, status=400)
+        try:
+            halted = bool(self._toggle_fn())
+            logger.warning(f"Dashboard kill switch toggled — live_halt={halted}")
+            return web.json_response({"live_halt": halted})
+        except Exception as exc:
+            logger.error(f"Kill switch toggle failed: {exc}")
+            return web.json_response({"error": str(exc)}, status=500)
 
     async def _ws(self, request):
         ws = web.WebSocketResponse(heartbeat=20)

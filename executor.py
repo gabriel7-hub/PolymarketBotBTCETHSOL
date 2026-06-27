@@ -176,7 +176,9 @@ class Executor:
                     time_in_force="IOC",
                 )
                 self._client.create_and_post_order(
-                    OrderArgs(token_id=token_id, price=opp_ask, size=hedge_usdc, side=BUY),
+                    # OrderArgs.size is SHARES (outcome tokens), not USDC — hedge the same
+                    # share count as the position so the pair redeems $1.
+                    OrderArgs(token_id=token_id, price=opp_ask, size=round(shares, 2), side=BUY),
                     options=options,
                 )
             except Exception as exc:
@@ -327,6 +329,22 @@ class Executor:
 
     # ─── Live execution ────────────────────────────────────────────────────────
 
+    def execute_certainty_live(self, signal: Signal, window: MarketWindow,
+                               side: str, ask: float, size_usdc: float) -> bool:
+        """LIVE certainty / feed-lag order (live assets only). Places an IOC buy at the touch
+        and opens a REAL position that settles through on_market_resolved() — i.e. it reuses
+        the exact resolution + P&L + risk path as any taker fill. The ledger row is leg='TAKER'
+        (so resolve_taker_ledger settles it) but the detail is tagged CERTAINTY. Returns True
+        if the order was placed."""
+        if self._active_pos_id is not None:
+            return False                                   # one position per asset-window
+        token_id = window.up_token_id if side == "UP" else window.down_token_id
+        price = round(min(config.CERTAINTY_MAX_ASK, ask), 2)
+        logger.warning(f"[LIVE·CERT][{self.asset}] {side} @ {price:.2f} | size=${size_usdc} "
+                       f"| p={signal.p_up if side=='UP' else signal.p_down:.3f} "
+                       f"T-{signal.time_remaining:.0f}s")
+        return self._live_execute(signal, window, side, price, size_usdc, "TAKER", token_id)
+
     def _live_execute(self, signal: Signal, window: MarketWindow, side: str,
                       price: float, size_usdc: float, order_type: str,
                       token_id: str) -> bool:
@@ -340,8 +358,14 @@ class Executor:
                 neg_risk=window.neg_risk,
                 **({"time_in_force": "IOC"} if order_type == "TAKER" else {}),
             )
+            # Polymarket OrderArgs.size is the number of OUTCOME TOKENS (shares), NOT the USDC
+            # notional. Deploy `size_usdc` dollars at `price` => shares = size_usdc / price.
+            shares = round(size_usdc / price, 2) if price > 0 else 0.0
+            if shares <= 0:
+                logger.error(f"[LIVE][{self.asset}] computed 0 shares for ${size_usdc} @ {price}")
+                return False
             resp = self._client.create_and_post_order(
-                OrderArgs(token_id=token_id, price=price, size=size_usdc, side=BUY),
+                OrderArgs(token_id=token_id, price=price, size=shares, side=BUY),
                 options=options,
             )
             order_id = resp.get("orderID") or resp.get("id") or ""
@@ -386,7 +410,8 @@ class Executor:
             key=config.PRIVATE_KEY,
             chain_id=137,
             creds=creds,
-            signature_type=2,
+            signature_type=config.SIGNATURE_TYPE,
             funder=config.WALLET_ADDRESS,
         )
-        logger.info("CLOB client initialised (live mode)")
+        logger.info(f"CLOB client initialised (live mode) | sig_type={config.SIGNATURE_TYPE} "
+                    f"funder={config.WALLET_ADDRESS}")

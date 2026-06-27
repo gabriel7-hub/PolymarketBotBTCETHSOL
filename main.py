@@ -41,11 +41,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def start_dashboard_server(bot_state_fn):
-    """Single aiohttp server serves both the page and the live WS feed on one port."""
+def start_dashboard_server(bot_state_fn, toggle_fn=None):
+    """Single aiohttp server serves both the page and the live WS feed on one port.
+    `toggle_fn` (optional) is the LIVE kill switch invoked by the dashboard button."""
     try:
         from dashboard_server import DashboardServer
-        server = DashboardServer(state_fn=bot_state_fn)
+        server = DashboardServer(state_fn=bot_state_fn, toggle_fn=toggle_fn)
         t = threading.Thread(target=server.run, daemon=True, name="dashboard")
         t.start()
     except Exception as exc:
@@ -59,9 +60,13 @@ class AssetWorker:
     strike snapshots, resolution tracking, and a dashboard snapshot fragment.
     """
 
-    def __init__(self, asset: str, paper_mode: bool = True):
+    def __init__(self, asset: str, paper_mode: bool = True,
+                 live_halt: Optional[threading.Event] = None):
         self.asset = asset
         self.paper_mode = paper_mode
+        # Shared across all workers: when SET, no new LIVE orders are placed (dashboard kill
+        # switch). Open positions still resolve normally. Paper mode ignores it.
+        self.live_halt = live_halt if live_halt is not None else threading.Event()
 
         self.discovery = MarketDiscovery(asset)
         self.binance   = BinanceFeed(asset)
@@ -292,18 +297,41 @@ class AssetWorker:
                         logger.info(f"[PAPER·EXPERIMENTAL][{self.asset}] late-momentum "
                                     f"{signal.order_side}@{signal.order_price:.2f}")
 
-                # Certainty / feed-lag SHADOW leg (APPROACH.md §3①) — PAPER ONLY, fully
-                # isolated: a separate `if` (not part of the elif dispatch), so it never
-                # preempts or is preempted by the real legs. Records one leg='CERTAINTY'
-                # ledger row per window via the live book's PAPER_FILL_REALISM path; no real
-                # position, no risk-guard interaction. Resolved in _resolve_cert_shadow.
+                # Certainty / feed-lag leg (APPROACH.md §3①) — a separate `if` (not in the
+                # elif dispatch), so it never preempts or is preempted by the real legs.
+                #   PAPER mode: records an isolated leg='CERTAINTY' shadow row via the live
+                #     book's PAPER_FILL_REALISM path; no real position. Resolved in
+                #     _resolve_cert_shadow.
+                #   LIVE mode (2026-06-26): places a REAL IOC order through the risk guard and
+                #     the dashboard kill switch; opens a real position resolved by
+                #     _resolve_position (a sentinel marks the window done in _cert_shadow).
                 # Require a valid strike: with no Price-to-Beat the model prices against
                 # ref=0 and returns a garbage p≈0.99, which would fire the gate on cheap
                 # asks (the STRIKE-MISSED bug). The real taker/late-mom legs gate on this too.
-                if (self.paper_mode and window.has_reference
+                if (window.has_reference
+                        and self.asset in config.CERTAINTY_ASSETS
                         and start_ts not in self._cert_shadow):
                     pick = self.engine.certainty_shadow(signal)
-                    if pick is not None:
+                    if pick is not None and not self.paper_mode:
+                        # ── LIVE certainty order ──────────────────────────────────────────
+                        # Real USDC. Gated by (1) the dashboard kill switch and (2) the
+                        # per-asset risk guard (open-position + global daily-loss halt). Opens
+                        # a real position resolved by _resolve_position; a sentinel in
+                        # _cert_shadow stops the gate from re-firing this window.
+                        cside, cask, csize = pick
+                        if self.live_halt.is_set():
+                            logger.info(f"[LIVE·CERT][{self.asset}] skip — LIVE trading "
+                                        f"STOPPED (dashboard kill switch)")
+                        else:
+                            ok, why = self.risk.check()
+                            if not ok:
+                                logger.info(f"[LIVE·CERT][{self.asset}] skip — risk: {why}")
+                            elif self.executor.execute_certainty_live(
+                                    signal, window, cside, cask, csize):
+                                self._cert_shadow[start_ts] = {"live": True, "side": cside}
+                                if start_ts not in self._resolved:
+                                    self._pending[start_ts] = window.condition_id
+                    elif pick is not None:
                         cside, cask, csize = pick
                         # Depth-realistic fill: DECIDE on the displayed ask, FILL by walking
                         # the live book (VWAP) + one adverse latency tick — the very realism
@@ -561,6 +589,8 @@ class AssetWorker:
         cs = self._cert_shadow.pop(start_ts, None)
         if not cs:
             return
+        if cs.get("live"):
+            return        # live certainty is a REAL position; settled by _resolve_position
         import pricing
         entry = cs["price"]
         shares = cs.get("shares") or (config.CERTAINTY_SIZE_USDC / entry)
@@ -743,10 +773,13 @@ class AssetWorker:
         is a paper shadow (no real `positions` row), so without this the trade log shows OPEN
         while the OPEN POSITION panel says 'No open position'. Cert shadows are popped on
         resolution, so anything left in _cert_shadow is genuinely live."""
-        if not self._cert_shadow:
+        # Live certainty entries are sentinels (no price/shares) — their real position shows
+        # via state.get_open_position; only paper shadows surface here.
+        shadows = {k: v for k, v in self._cert_shadow.items() if not v.get("live")}
+        if not shadows:
             return None
-        start_ts = max(self._cert_shadow)          # most recent open shadow
-        cs = self._cert_shadow[start_ts]
+        start_ts = max(shadows)                     # most recent open shadow
+        cs = shadows[start_ts]
         px = cs.get("price") or 0.0
         return {
             "side": cs.get("side"),
@@ -769,13 +802,28 @@ class BotRunner:
         if pruned:
             logger.info(f"Pruned {pruned} old tick/signal row(s) (> {config.TICK_RETENTION_DAYS}d)")
 
-        self.workers = {a: AssetWorker(a, paper_mode=paper_mode) for a in config.ASSETS}
+        # One shared kill switch for every worker — flipped from the dashboard. When SET,
+        # workers place no new LIVE orders; open positions still resolve.
+        self.live_halt = threading.Event()
+        self.workers = {a: AssetWorker(a, paper_mode=paper_mode, live_halt=self.live_halt)
+                        for a in config.ASSETS}
         self._dash_state: dict = {}
         self._last_maintenance = time.time()
         self._stop = threading.Event()
 
     def get_dashboard_state(self) -> dict:
         return self._dash_state
+
+    def toggle_live_halt(self) -> bool:
+        """Dashboard kill switch. Returns the new halted state (True = LIVE trading stopped)."""
+        if self.live_halt.is_set():
+            self.live_halt.clear()
+            logger.warning("LIVE trading RESUMED via dashboard kill switch")
+        else:
+            self.live_halt.set()
+            logger.warning("LIVE trading STOPPED via dashboard kill switch — "
+                           "no new live orders will be placed")
+        return self.live_halt.is_set()
 
     def start(self):
         for w in self.workers.values():
@@ -820,11 +868,21 @@ class BotRunner:
             # Global status: HALTED if the shared daily-loss guard tripped (live), else
             # the mode label. Per-asset cooldowns show in each asset's risk_status.
             any_halt = any(w.risk.is_halted for w in self.workers.values())
+            live_stopped = self.live_halt.is_set()
+            if self.paper_mode:
+                status = "PAPER"
+            elif live_stopped:
+                status = "STOPPED"
+            elif any_halt:
+                status = "HALTED"
+            else:
+                status = "LIVE"
             self._dash_state = {
                 "ts": time.time(),
                 "bot": {
                     "mode": "PAPER" if self.paper_mode else "LIVE",
-                    "status": "HALTED" if any_halt else ("PAPER" if self.paper_mode else "LIVE"),
+                    "status": status,
+                    "live_halt": live_stopped,
                     "assets": list(self.workers.keys()),
                     "daily_pnl": round(daily.get("net_pnl", 0.0), 2),
                     "daily_trades": daily.get("trades", 0),
@@ -894,7 +952,8 @@ def main():
 
     runner = BotRunner(paper_mode=paper_mode)
     if not args.no_dashboard:
-        start_dashboard_server(runner.get_dashboard_state)
+        start_dashboard_server(runner.get_dashboard_state,
+                               toggle_fn=runner.toggle_live_halt)
     runner.start()
 
 

@@ -17,6 +17,7 @@ set -u
 cd "$(dirname "$0")"
 
 PY="${PYTHON:-python3}"
+MODE="${MODE:-paper}"          # MODE=live ./run.sh  to trade real funds; default paper
 LOG="bot.log"
 DELAY=2
 MAX_DELAY=60
@@ -25,9 +26,9 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') | SUPERVISOR | $*" | tee -a "$LOG"; }
 
 trap 'log "supervisor received INT/TERM — stopping"; exit 0' INT TERM
 
-log "supervisor starting: $PY main.py --mode paper $*"
+log "supervisor starting: $PY main.py --mode $MODE $*"
 while true; do
-  "$PY" main.py --mode paper "$@"
+  "$PY" main.py --mode "$MODE" "$@"
   code=$?
   if [ "$code" -eq 0 ]; then
     log "main.py exited cleanly (0) — stopping supervisor"

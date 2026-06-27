@@ -47,6 +47,11 @@ header{
 .pill.live{color:var(--up);background:rgba(25,230,168,.1);border:1px solid rgba(25,230,168,.3)}
 .pill.halted{color:var(--down);background:rgba(255,79,107,.14);border:1px solid rgba(255,79,107,.35)}
 .pill.cooldown{color:var(--warn);background:rgba(255,178,46,.12);border:1px solid rgba(255,178,46,.3)}
+.pill.stopped{color:var(--down);background:rgba(255,79,107,.2);border:1px solid rgba(255,79,107,.5)}
+.killbtn{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.12em;padding:6px 13px;border-radius:3px;border:1px solid var(--down);background:rgba(255,79,107,.16);color:var(--down);cursor:pointer;transition:filter .15s,background .15s}
+.killbtn:hover{filter:brightness(1.25)}
+.killbtn.resume{border-color:var(--up);background:rgba(25,230,168,.16);color:var(--up)}
+.killbtn.hidden{display:none}
 .feeds{margin-left:auto;display:flex;gap:18px;align-items:center}
 .led{display:flex;align-items:center;gap:7px;font-size:10px;letter-spacing:.1em;color:var(--ink-3);text-transform:uppercase}
 .led i{width:7px;height:7px;border-radius:50%;background:var(--ink-4);transition:.3s}
@@ -192,6 +197,7 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
     <div class="hstat"><span class="k">Reward Yield</span><span id="h-rebate" class="v num up">—</span></div>
     <div class="hstat"><span class="k">Trades</span><span id="h-trades" class="v num">0</span></div>
     <div class="hstat"><span class="k">Win Rate</span><span id="h-wr" class="v num muted">—</span></div>
+    <button id="kill-btn" class="killbtn hidden" onclick="toggleLive()" title="Stop/resume placing new LIVE orders">STOP LIVE</button>
     <div class="feeds">
       <span class="clock" id="clock">--:--:--</span>
       <span class="led off" id="led-oracle"><i></i>Oracle</span>
@@ -384,6 +390,19 @@ function connect(){
   // (the watchdog only ever SET it, so without this it stuck until a manual refresh).
   ws.onmessage=e=>{try{const d=JSON.parse(e.data);last=Date.now();off(false);led('led-ws',true);render(d)}catch(_){}}
 }
+function toggleLive(){
+  const b=$('kill-btn'); if(b)b.disabled=true;
+  fetch('/api/live/toggle',{method:'POST'})
+    .then(r=>r.json())
+    .then(j=>{if(j&&typeof j.live_halt==='boolean')applyKill(j.live_halt)})
+    .catch(()=>{})
+    .finally(()=>{if(b)b.disabled=false});
+}
+function applyKill(halted){
+  const b=$('kill-btn'); if(!b)return;
+  b.textContent=halted?'RESUME LIVE':'STOP LIVE';
+  b.className='killbtn'+(halted?' resume':'');   // visible (no 'hidden') whenever LIVE
+}
 function off(s){document.getElementById('off').classList.toggle('show',s)}
 function led(id,on){const e=document.getElementById(id);e.className='led '+(on?'on':'off')}
 function $(id){return document.getElementById(id)}
@@ -407,6 +426,9 @@ function render(d){
   set('h-rebate',bot.rebates_today!=null?'+$'+f(bot.rebates_today,3):'—','v num up');
   set('h-trades',String(bot.daily_trades||0),'v num');
   set('h-wr',bot.win_rate!=null?pct(bot.win_rate):'—','v num '+(bot.win_rate>=.5?'up':bot.win_rate!=null?'down':'muted'));
+  // LIVE kill switch — only shown in LIVE mode; reflects the bot's live_halt flag.
+  const kb=$('kill-btn');
+  if(kb){ if(bot.mode==='LIVE'){applyKill(!!bot.live_halt)} else {kb.className='killbtn hidden'} }
   led('led-oracle',!!btc.connected); led('led-book',!!bk.connected);
 
   // oracle price block

@@ -14,6 +14,11 @@ CLOB_API_KEY         = os.getenv("CLOB_API_KEY", "")
 CLOB_API_SECRET      = os.getenv("CLOB_API_SECRET", "")
 CLOB_API_PASSPHRASE  = os.getenv("CLOB_API_PASSPHRASE", "")
 WALLET_ADDRESS       = os.getenv("WALLET_ADDRESS", "")
+# CLOB order signature type: 0=EOA, 1=POLY_PROXY (Magic/email proxy),
+# 2=POLY_GNOSIS_SAFE (browser wallet), 3=POLY_1271 (EIP-1271 smart-contract wallet — the
+# new Polymarket Gmail/Magic account that holds pUSD). Verified 2026-06-27: this account is
+# type 3 with funder=WALLET_ADDRESS (0x77ef…), $200.53 pUSD, allowances already set.
+SIGNATURE_TYPE       = int(os.getenv("SIGNATURE_TYPE", "3"))
 
 # ─── API Endpoints ─────────────────────────────────────────────────────────────
 CLOB_HOST            = "https://clob.polymarket.com"
@@ -128,7 +133,10 @@ MIN_TAKER_ENTRY      = 0.72    # never IOC a side whose ask is below this. RAISE
 # behaviour for comparison.)
 DIRECTIONAL_TAKER_ENABLED = False
 
-BOX_STOP_ENABLED     = True    # hedge-to-box stop-loss on the open taker position
+BOX_STOP_ENABLED     = False   # OFF for live: the only live positions are CERTAINTY, and
+                               # boxing the certainty leg is net-negative (clips small wins,
+                               # can't catch late flips — see memory "certainty boxing fails").
+                               # Re-enable only if the directional taker is ever turned back on.
 # Box trigger: p_side < 1 − opposite_ask − margin. One margin was doing two opposing
 # jobs, so it is split by what the box would lock (entry + opposite_ask vs $1):
 #   LOSS side  — tight, react while the hedge is still cheap (−$10 beats −$26). Replay
@@ -273,11 +281,23 @@ LATE_MOMENTUM_SIZE_USDC  = 25.0    # paper notional per late-momentum bet
 # Mirrors the backtest gate: enter the confident side iff  p_side ≥ FLOOR  AND
 # ask ≤ p_side − LAG_MARGIN  AND  ask ≤ MAX_ASK  AND spread ≤ MAX_SPREAD AND fee-net EV ≥ 0.
 CERTAINTY_SHADOW_ENABLED = True    # master switch (paper-only effect). False = complete no-op.
+# Per-asset gate: the certainty edge is concentrated in SOL/XRP. On fresh post-2026-06-21 paper
+# data (recovered.db, 1,124 resolved shadows since Jun-22 09:00 ET, realistic +1-tick fill):
+#   SOL+XRP : PF 1.72 / win 93.0% / EV $1.29   (CLEARS the 1.5 live gate)
+#   BTC+ETH : PF 1.06 / win 88.7% / EV ~0       (carries adverse-selection risk for no edge)
+# So the leg only fires on the assets below; BTC/ETH still trade/record everything else but skip
+# the certainty shadow. Revisit if BTC/ETH accumulate a PF>=1.5 sample. Validated 2026-06-24.
+# 2026-06-26: user opted to run ALL FOUR assets LIVE on one shared bankroll. NOTE (evidence):
+# BTC/ETH certainty is ~breakeven (PF ~1.06-1.14, <1pt win-rate cushion) and losses are
+# CORRELATED across assets (one window flipped all four at once for -$102 on paper), so adding
+# BTC/ETH amplifies the simultaneous-loss tail rather than diversifying it. The dashboard kill
+# switch is the safety valve. Revert to ("SOL","XRP") to run only the gate-clearing assets.
+CERTAINTY_ASSETS = ("BTC", "ETH", "SOL", "XRP")  # assets the certainty leg fires on (paper & live)
 CERTAINTY_FLOOR      = 0.80        # min model prob for the side to count as "certain"
 CERTAINTY_LAG_MARGIN = 0.03        # min book lag (p_side − ask) required to enter
 CERTAINTY_MAX_ASK    = 0.97        # never buy above this — taker fee eats the edge past here
 CERTAINTY_MIN_ASK    = 0.82        # never buy BELOW this — see note. Validated 2026-06-22.
-CERTAINTY_SIZE_USDC  = 25.0        # base paper notional per certainty bet
+CERTAINTY_SIZE_USDC  = 5.0         # base notional per certainty bet (reduced 25->5 for first live tranche 2026-06-26)
 # CERTAINTY_MIN_ASK: only enter when the BOOK already prices the favorite ≥ this. A large
 # model-vs-book gap (model 0.90 while the book sits near 0.50) is NOT feed-lag — it is model
 # overconfidence against a fairly-priced book, and those entries LOSE under realistic fills.
@@ -311,8 +331,8 @@ CERTAINTY_MIN_MOVE_BP = 5.0
 # size up there instead of flat $25. Stake = base, bumped to LATE_SIZE inside the late zone
 # when the move gate is strongly cleared. Capped by CERTAINTY_MAX_SIZE_USDC. Paper-only effect.
 CERTAINTY_LATE_FROM   = 45         # secs remaining at/below which "late-slice" sizing applies
-CERTAINTY_LATE_SIZE_USDC = 50.0    # paper notional in the validated late slice
-CERTAINTY_MAX_SIZE_USDC  = 50.0    # hard cap on any single certainty bet
+CERTAINTY_LATE_SIZE_USDC = 5.0     # flat $5 for first live tranche (late 2x dropped 2026-06-26)
+CERTAINTY_MAX_SIZE_USDC  = 5.0     # hard cap on any single certainty bet
 
 # ─── Fee Constants (Fee Structure V2, effective Mar 30 2026) ───────────────────
 # Crypto taker fee = C × 0.07 × p × (1−p), per share. Makers pay zero.
