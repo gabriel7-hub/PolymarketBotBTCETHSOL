@@ -108,6 +108,11 @@ class DashboardServer:
         button can re-label without waiting for the next snapshot push."""
         if self._toggle_fn is None:
             return web.json_response({"error": "no control channel"}, status=400)
+        # When a token is configured (dashboard reachable beyond localhost), require it so a
+        # stranger who finds the URL can't stop/start live trading.
+        if config.DASHBOARD_TOKEN and request.headers.get("X-Dashboard-Token") != config.DASHBOARD_TOKEN:
+            logger.warning(f"Kill switch toggle REJECTED (bad/missing token) from {request.remote}")
+            return web.json_response({"error": "unauthorized"}, status=401)
         try:
             halted = bool(self._toggle_fn())
             logger.warning(f"Dashboard kill switch toggled — live_halt={halted}")

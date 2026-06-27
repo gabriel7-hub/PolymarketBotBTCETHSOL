@@ -19,7 +19,7 @@ from market_discovery import MarketWindow
 # py_clob_client_v2 is only required in live mode
 try:
     from py_clob_client_v2 import ClobClient, OrderArgs, PartialCreateOrderOptions
-    from py_clob_client_v2.clob_types import ApiCreds
+    from py_clob_client_v2.clob_types import ApiCreds, OrderType
     from py_clob_client_v2.order_builder.constants import BUY, SELL
     _CLIENT_AVAILABLE = True
 except ImportError:
@@ -173,13 +173,13 @@ class Executor:
             try:
                 options = PartialCreateOrderOptions(
                     tick_size=window.tick_size, neg_risk=window.neg_risk,
-                    time_in_force="IOC",
                 )
                 self._client.create_and_post_order(
                     # OrderArgs.size is SHARES (outcome tokens), not USDC — hedge the same
                     # share count as the position so the pair redeems $1.
                     OrderArgs(token_id=token_id, price=opp_ask, size=round(shares, 2), side=BUY),
                     options=options,
+                    order_type=OrderType.FAK,
                 )
             except Exception as exc:
                 logger.error(f"Box hedge order failed: {exc}")
@@ -356,8 +356,11 @@ class Executor:
             options = PartialCreateOrderOptions(
                 tick_size=window.tick_size,
                 neg_risk=window.neg_risk,
-                **({"time_in_force": "IOC"} if order_type == "TAKER" else {}),
             )
+            # Order time-in-force is a create_and_post_order arg (NOT an options field):
+            # FAK = Fill-And-Kill (IOC — take what's available now, cancel the rest) for a
+            # taker; GTC for a resting maker quote.
+            otype = OrderType.FAK if order_type == "TAKER" else OrderType.GTC
             # Polymarket OrderArgs.size is the number of OUTCOME TOKENS (shares), NOT the USDC
             # notional. Deploy `size_usdc` dollars at `price` => shares = size_usdc / price.
             shares = round(size_usdc / price, 2) if price > 0 else 0.0
@@ -367,6 +370,7 @@ class Executor:
             resp = self._client.create_and_post_order(
                 OrderArgs(token_id=token_id, price=price, size=shares, side=BUY),
                 options=options,
+                order_type=otype,
             )
             order_id = resp.get("orderID") or resp.get("id") or ""
             pos_id = state.open_position({

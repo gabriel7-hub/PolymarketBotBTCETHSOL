@@ -356,6 +356,11 @@ DASHBOARD_HTTP_PORT  = int(os.getenv("DASHBOARD_HTTP_PORT", "8000"))  # serves t
 # `ssh -L 8000:localhost:8000 user@vps`). Set DASHBOARD_HOST=0.0.0.0 to expose it on the VPS
 # IP — only do that behind a firewall, since it reveals your live trading state to anyone.
 DASHBOARD_HOST       = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+# Optional shared secret to protect the LIVE kill-switch endpoint when the dashboard is
+# reachable beyond localhost. If set, POST /api/live/toggle requires header
+# X-Dashboard-Token to match (the UI prompts once and stores it locally). Empty = no check
+# (fine for a localhost/SSH-tunnel-only dashboard).
+DASHBOARD_TOKEN      = os.getenv("DASHBOARD_TOKEN", "")
 STATE_PUSH_INTERVAL  = 1.0     # seconds between dashboard WebSocket pushes
 
 # ─── Data retention (bound DB growth on a long-running host) ────────────────────

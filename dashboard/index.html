@@ -353,7 +353,10 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
 <script>
 // Same host+port the page was served from, so the WS can't be blocked by a
 // cross-port/IPv6/Safari quirk. Falls back to localhost:8000 if opened via file://.
-const WS_URL=(location.host?'ws://'+location.host:'ws://localhost:8000')+'/ws';
+// Base path of the page (e.g. "/" locally or "/polybot/" behind a reverse proxy), so the
+// WS and control endpoints resolve correctly whether served at root or under a sub-path.
+const BASE=location.pathname.replace(/[^/]*$/,'');     // dir of current page; always ends with /
+const WS_URL=(location.protocol==='https:'?'wss://':'ws://')+(location.host||'localhost:8000')+BASE+'ws';
 const RING_LEN=2*Math.PI*76;            // 477.5
 const EV_MAX=0.10, ARB_MAX=0.06;        // meter full-scale
 const EV_THR=0.03, ARB_THR=0.005;       // config thresholds (MIN_EV_TAKER / MIN_ARB_EDGE)
@@ -390,10 +393,14 @@ function connect(){
   // (the watchdog only ever SET it, so without this it stuck until a manual refresh).
   ws.onmessage=e=>{try{const d=JSON.parse(e.data);last=Date.now();off(false);led('led-ws',true);render(d)}catch(_){}}
 }
+function killHeaders(){const t=localStorage.getItem('polydesk_token');return t?{'X-Dashboard-Token':t}:{}}
 function toggleLive(){
   const b=$('kill-btn'); if(b)b.disabled=true;
-  fetch('/api/live/toggle',{method:'POST'})
-    .then(r=>r.json())
+  fetch(BASE+'api/live/toggle',{method:'POST',headers:killHeaders()})
+    .then(r=>{
+      if(r.status===401){const t=prompt('Dashboard token (set DASHBOARD_TOKEN on the server):');
+        if(t)localStorage.setItem('polydesk_token',t); throw 'auth';}
+      return r.json();})
     .then(j=>{if(j&&typeof j.live_halt==='boolean')applyKill(j.live_halt)})
     .catch(()=>{})
     .finally(()=>{if(b)b.disabled=false});
