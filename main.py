@@ -387,8 +387,14 @@ class AssetWorker:
                 if (window.has_reference and window.time_remaining < 2
                         and start_ts not in self._resolved):
                     self._pending[start_ts] = window.condition_id
-                    if start_ts not in self._settles and self.oracle.price > 0:
-                        self._settles[start_ts] = self.oracle.price
+                    if start_ts not in self._settles:
+                        # Prefer the Chainlink reading (Polymarket's settlement feed) for the
+                        # close snapshot so a live self-settle matches the official outcome;
+                        # fall back to the blended proxy only if Chainlink is stale.
+                        cl = self.oracle.chainlink_price
+                        snap = cl if cl and cl > 0 else self.oracle.price
+                        if snap > 0:
+                            self._settles[start_ts] = snap
 
                 self._update_snapshot(window=window, signal=signal)
                 time.sleep(1)
@@ -470,7 +476,13 @@ class AssetWorker:
 
             if winning is None:
                 grace_done = time.time() - closed_at >= config.RESOLUTION_FALLBACK_SECS
-                if self.paper_mode and ref and grace_done:
+                # Self-settle (paper AND live) on our Chainlink-vs-strike reading if the
+                # official Gamma outcome hasn't posted yet — it lags close by minutes and was
+                # leaving live positions OPEN, blocking the next window. Chainlink IS the feed
+                # Polymarket settles on, and certainty bets need a ≥5bp move (non-borderline),
+                # so this matches the official result ~always; Pass 2 still chases the REAL
+                # outcome and _resettle_to_real corrects the rare disagreement.
+                if ref and grace_done:
                     winning, source = predicted, "FALLBACK"
                     self._awaiting_real[start_ts] = condition_id   # upgrade to REAL later
                 elif time.time() - closed_at >= config.RESOLUTION_GIVEUP_SECS:
@@ -505,8 +517,8 @@ class AssetWorker:
             self._resolve_late_mom(start_ts, winning)
             self._resolve_cert_shadow(start_ts, winning)
             if source == "FALLBACK":
-                logger.info(f"[{self.asset}] Window {start_ts} settled (paper, oracle): "
-                            f"{winning} — chasing real outcome in background")
+                logger.info(f"[{self.asset}] Window {start_ts} self-settled (Chainlink vs "
+                            f"strike): {winning} — confirming vs official outcome in background")
             self._pending.pop(start_ts, None)
             self._settles.pop(start_ts, None)
             self._resolved.add(start_ts)
