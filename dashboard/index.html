@@ -566,7 +566,9 @@ function renderTrades(rows){
   if(!rows||!rows.length){tb.innerHTML='<tr><td colspan="9" class="muted" style="text-align:center;padding:18px">No trades yet</td></tr>';return}
   tb.innerHTML=rows.map(t=>{
     const asset=t.asset||'BTC';
-    const leg=t.leg||t.order_type||'—';                 // FARM | ARB | TAKER
+    let leg=t.leg||t.order_type||'—';                   // FARM | ARB | TAKER | CERT_LIVE | CERTAINTY_BOX
+    if(leg==='CERT_LIVE')leg='CERTAINTY';               // live certainty market-buy (booked as a taker)
+    else if(leg==='CERTAINTY_BOX')leg='BOX·SHADOW';     // shadow hedge — not a real order
     const legc=leg==='FARM'?'farm':leg==='ARB'?'arb':'muted';
     const outcome=t.outcome||t.status||'—';
     const oc=outcome==='WIN'?'up':outcome==='LOSS'?'down':outcome==='FARM'?'farm':outcome==='ARB'?'arb':'muted';

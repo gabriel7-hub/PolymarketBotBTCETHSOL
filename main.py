@@ -95,6 +95,7 @@ class AssetWorker:
         self._cert_shadow_session: float = 0.0   # paper P&L of the certainty shadow leg
         self._box_shadow: dict[int, dict] = {}   # start_ts -> open certainty BOX hedge (shadow)
         self._box_shadow_session: float = 0.0    # cumulative counterfactual P&L impact of boxing
+        self._box_adv_run: dict[int, int] = {}   # start_ts -> consecutive adverse ticks (box de-noise)
         self._last_tick_ts: float = time.time()
         self._farm_reward_session: float = 0.0   # est reward accrued this session
         self._last_farm: dict = {}               # last farm quote details for dashboard
@@ -660,12 +661,16 @@ class AssetWorker:
         """
         if not config.CERTAINTY_BOX_ENABLED or not window.has_reference:
             return
-        if start_ts not in self._cert_shadow or start_ts in self._box_shadow:
-            return                       # no live cert bet this window, or already boxed it
-        cs = self._cert_shadow[start_ts]
-        # Resolve the protected position: a paper shadow carries side/price/shares; a LIVE
-        # certainty bet is a real `positions` row (the shadow dict is just a sentinel).
-        if cs.get("live"):
+        if start_ts in self._box_shadow:
+            return                       # already boxed this window
+        # Resolve the protected position.
+        #   LIVE: box the REAL open position directly — do NOT depend on the in-memory cert
+        #   sentinel (a restart wipes _cert_shadow, which would silently leave an already-open
+        #   live position un-boxed) nor on its ledger leg/order_type (a live certainty
+        #   market-buy is recorded as 'TAKER'). The directional taker is disabled, so the only
+        #   open position is the certainty leg.
+        #   PAPER: the cert leg has no real position — read the paper shadow's side/price/shares.
+        if not self.paper_mode:
             pos = state.get_open_position(self.asset)
             if (not pos or pos["market_id"] != window.condition_id
                     or not pos.get("entry_price")):
@@ -673,47 +678,72 @@ class AssetWorker:
             side, entry = pos["side"], pos["entry_price"]
             shares = pos["size_usdc"] / entry
         else:
+            cs = self._cert_shadow.get(start_ts)
+            if not cs or cs.get("live"):
+                return
             side, entry, shares = cs.get("side"), cs.get("price"), cs.get("shares")
         if not side or not entry or not shares:
             return
-        # Timing: only inside the validated last-N-secs zone, with enough time to model a fill.
         t = window.time_remaining
-        if t > config.CERTAINTY_BOX_FROM or t < config.CERTAINTY_BOX_MIN_T:
-            return
-        # Adverse = the oracle has crossed to the LOSING side of the strike for our bet.
+        # Opposite side + how far the oracle has moved AGAINST our bet (the resolution variable).
         # distance_bp = (oracle − ref)/ref·1e4 → UP loses when negative, DOWN when positive.
         if side == "UP":
             adverse_bp, opp_side, opp_ask = -signal.distance_bp, "DOWN", signal.down_ask
         else:
             adverse_bp, opp_side, opp_ask = signal.distance_bp, "UP", signal.up_ask
-        if adverse_bp < config.CERTAINTY_BOX_MARGIN_BP:
-            cs["adv_run"] = 0
+        if opp_ask is None:
             return
-        cs["adv_run"] = cs.get("adv_run", 0) + 1
-        if cs["adv_run"] < config.CERTAINTY_BOX_PERSIST:
-            return                       # de-noise: require consecutive adverse ticks
-        if opp_ask is None or opp_ask >= config.CERTAINTY_BOX_MAX_OPP_ASK:
-            return                       # late flip: hedge already too rich to help — ride it
+
+        # Two shadow triggers, CREDIT first:
+        #   CREDIT  — the pair already locks a credit (entry+opp_ask ≤ cap): risk-free to lock,
+        #             box regardless of direction. Rare for us (expensive favorite entries).
+        #   LOSS-CAP — the oracle has crossed to our LOSING side for ≥persist ticks inside the last
+        #             FROM secs and the hedge is not yet too rich: cap the loss.
+        kind = None
+        if (config.CERTAINTY_BOX_CREDIT
+                and config.CERTAINTY_BOX_MIN_T <= t <= config.CERTAINTY_BOX_CREDIT_FROM
+                and entry + opp_ask <= config.CERTAINTY_BOX_CREDIT_MAX):
+            kind = "CREDIT"
+        if kind is None:
+            if t > config.CERTAINTY_BOX_FROM or t < config.CERTAINTY_BOX_MIN_T:
+                return
+            if adverse_bp < config.CERTAINTY_BOX_MARGIN_BP:
+                self._box_adv_run[start_ts] = 0
+                return
+            run = self._box_adv_run.get(start_ts, 0) + 1
+            self._box_adv_run[start_ts] = run
+            if run < config.CERTAINTY_BOX_PERSIST:
+                return                   # de-noise: require consecutive adverse ticks
+            if opp_ask >= config.CERTAINTY_BOX_MAX_OPP_ASK:
+                return                   # late flip: hedge already too rich to help — ride it
+            kind = "LOSS-CAP"
+
+        # Partial sizing: hedge only a fraction of the position (winners run ~0.5 to keep upside on
+        # a false trigger; 1.0 = full box, the validated default on our data).
+        frac = max(0.0, min(1.0, config.CERTAINTY_BOX_FRACTION))
+        want = shares * frac
+        if want <= 0:
+            return
         # Depth-realistic hedge fill: walk the REAL opposite book + one adverse latency tick.
         tick = float(getattr(window, "tick_size", None) or config.TICK_SIZE)
         if config.PAPER_FILL_REALISM and self.book is not None:
-            filled, vwap = self.book.fill_ask(opp_side, shares)
+            filled, vwap = self.book.fill_ask(opp_side, want)
             if filled <= 0:
-                logger.info(f"[BOX·SHADOW][{self.asset}] certainty {side} adverse but hedge "
+                logger.info(f"[BOX·SHADOW][{self.asset}] {kind} {side} trigger but hedge "
                             f"book empty/too thin — riding")
                 return                   # retry next tick (adv_run preserved)
             hedge_fill = min(0.99, vwap + config.PAPER_SLIPPAGE_TICKS * tick)
         else:
-            filled, hedge_fill = shares, opp_ask
-        # Cost guard: never pay more than the cap to lock a $1 box (the live max-buy guard).
+            filled, hedge_fill = want, opp_ask
+        # Cost guard: never pay more than the cap to lock the box.
         if entry + hedge_fill > config.CERTAINTY_BOX_MAX_TOTAL:
-            logger.info(f"[BOX·SHADOW][{self.asset}] skip — box cost {entry + hedge_fill:.2f} "
-                        f"> cap {config.CERTAINTY_BOX_MAX_TOTAL}")
+            logger.info(f"[BOX·SHADOW][{self.asset}] {kind} skip — box cost "
+                        f"{entry + hedge_fill:.2f} > cap {config.CERTAINTY_BOX_MAX_TOTAL}")
             return
         box_tid = state.record_trade({
             "asset": self.asset, "market_id": window.condition_id, "start_ts": start_ts,
             "leg": "CERTAINTY_BOX", "side": opp_side, "price": round(hedge_fill, 4),
-            "detail": f"BOXED {side} → hedge {opp_side}@{hedge_fill:.3f} "
+            "detail": f"BOX[{kind}] {side} → hedge {opp_side}@{hedge_fill:.3f} x{frac:.0%} "
                       f"total={entry + hedge_fill:.2f} T-{t:.0f}s (shadow, not live)",
             "size_usdc": round(filled * hedge_fill, 2),
             "status": "OPEN", "outcome": None,
@@ -721,10 +751,10 @@ class AssetWorker:
         self._box_shadow[start_ts] = {
             "long_side": side, "long_entry": entry, "long_shares": shares,
             "hedge_side": opp_side, "hedge_fill": hedge_fill, "hedge_shares": filled,
-            "trade_id": box_tid, "t": t,
+            "trade_id": box_tid, "t": t, "kind": kind,
         }
-        logger.info(f"[BOX·SHADOW][{self.asset}] certainty {side} adverse {adverse_bp:.1f}bp "
-                    f"T-{t:.0f}s → hedge {opp_side}@{hedge_fill:.3f} "
+        logger.info(f"[BOX·SHADOW][{self.asset}] {kind} {side} adverse {adverse_bp:.1f}bp "
+                    f"T-{t:.0f}s → hedge {opp_side}@{hedge_fill:.3f} x{frac:.0%} "
                     f"(box cost {entry + hedge_fill:.2f}, shadow not live)")
 
     def _resolve_box_shadow(self, start_ts: int, winning_side: str):
@@ -732,6 +762,7 @@ class AssetWorker:
         the depth-realistic hedge would have locked vs. riding the bet to resolution. Pure
         measurement — leg='CERTAINTY_BOX' is excluded from the P&L ledgers, so it NEVER moves
         real or headline P&L; it only proves out the live hedge before any real-capital box."""
+        self._box_adv_run.pop(start_ts, None)
         box = self._box_shadow.pop(start_ts, None)
         if not box:
             return
@@ -748,8 +779,9 @@ class AssetWorker:
                            outcome=("WIN" if hside == winning_side else "LOSS"),
                            pnl_usdc=round(hedge_pnl, 4), closed_at=time.time())
         self._box_shadow_session += saved
-        logger.info(f"[BOX·SHADOW][{self.asset}] resolved: ride {long_pnl:+.2f} vs boxed "
-                    f"{boxed:+.2f} (saved {saved:+.2f}; session {self._box_shadow_session:+.2f})")
+        logger.info(f"[BOX·SHADOW][{self.asset}] {box.get('kind','?')} resolved: ride "
+                    f"{long_pnl:+.2f} vs boxed {boxed:+.2f} (saved {saved:+.2f}; "
+                    f"session {self._box_shadow_session:+.2f})")
 
     def _maybe_box_position(self, signal, window):
         """

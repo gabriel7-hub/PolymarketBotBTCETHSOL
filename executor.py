@@ -205,13 +205,18 @@ class Executor:
         self._active_order_type = None
         return pnl
 
-    def _ledger_open_taker(self, window, side, price, size_usdc) -> int:
-        """Append a TAKER fill to the audit ledger (OPEN until the window resolves)."""
+    def _ledger_open_taker(self, window, side, price, size_usdc,
+                           leg: str = "TAKER", detail: Optional[str] = None) -> int:
+        """Append a taker fill to the audit ledger (OPEN until the window resolves). `leg` lets a
+        live CERTAINTY market-buy be tagged 'CERT_LIVE' so the dashboard Trade History shows it as
+        a certainty trade — NOT generic 'TAKER' — without colliding with the P&L aggregators, which
+        count the real `positions` row plus paper `leg='CERTAINTY'` shadows (so 'CERT_LIVE' is an
+        un-counted display mirror, never double-counted). resolve_taker_ledger settles both legs."""
         return state.record_trade({
             "asset": self.asset,
             "market_id": window.condition_id, "start_ts": int(window.start_ts),
-            "leg": "TAKER", "side": side, "price": price,
-            "detail": f"{side}@{price:.3f}", "size_usdc": size_usdc,
+            "leg": leg, "side": side, "price": price,
+            "detail": detail or f"{side}@{price:.3f}", "size_usdc": size_usdc,
             "pnl_usdc": 0.0, "status": "OPEN", "outcome": None,
         })
 
@@ -378,7 +383,9 @@ class Executor:
             self._active_order_id   = order_id
             self._active_pos_id     = pos_id
             self._active_order_type = "TAKER"
-            self._active_trade_id   = self._ledger_open_taker(window, side, entry, deployed)
+            self._active_trade_id   = self._ledger_open_taker(
+                window, side, entry, deployed, leg="CERT_LIVE",
+                detail=f"CERTAINTY {side}@{entry:.3f} (live)")
             logger.warning(f"[LIVE·CERT][{self.asset}] FILLED {side} ~${deployed:.2f} "
                            f"@~{entry:.3f} | order_id={order_id}")
             return True

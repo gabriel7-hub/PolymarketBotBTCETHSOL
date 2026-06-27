@@ -350,6 +350,18 @@ CERTAINTY_BOX_MARGIN_BP   = 1.0    # bet side must be adverse (oracle past strik
 CERTAINTY_BOX_PERSIST     = 2      # consecutive adverse 1s ticks required (de-noise the oracle)
 CERTAINTY_BOX_MAX_OPP_ASK = 0.88   # skip if the hedge is already this rich (late flip — no benefit)
 CERTAINTY_BOX_MAX_TOTAL   = 1.5    # never pay more than this per pair to lock a $1 box
+# Partial boxing — the leaderboard winners (Bonereaper) hedge only ~50% of the position so a false
+# trigger doesn't clip the whole win. 1.0 = full box (the validated +$552 default on our data); set
+# 0.5 to shadow-test the winners' partial profile. See WINNERS.md §8.4.
+CERTAINTY_BOX_FRACTION    = 1.0
+# Credit boxing — box opportunistically when the pair already locks a CREDIT (entry+opp_ask ≤ cap),
+# risk-free regardless of direction. This is the winners' "median pair cost $0.984" mechanic, but it
+# is an artifact of their CHEAP ~0.40 entries: with our 0.82+ favorite entries a credit (total<1)
+# needs opp_ask ≤ ~0.17, which means our side is already a deep favorite (likely to win) — so boxing
+# it usually FORFEITS EV. Default OFF; enable only to MEASURE how often/whether it ever helps us.
+CERTAINTY_BOX_CREDIT      = False
+CERTAINTY_BOX_CREDIT_MAX  = 0.99   # box if entry + opp_ask ≤ this (locks ≥1¢/pair)
+CERTAINTY_BOX_CREDIT_FROM = 70     # credit box may fire in the last N secs (winners' ~70s window)
 
 # ─── Fee Constants (Fee Structure V2, effective Mar 30 2026) ───────────────────
 # Crypto taker fee = C × 0.07 × p × (1−p), per share. Makers pay zero.

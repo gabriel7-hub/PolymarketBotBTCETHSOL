@@ -385,7 +385,7 @@ def reconcile_taker_ledger() -> int:
                 pnl_usdc = (SELECT p.pnl_usdc FROM positions p
                             WHERE p.market_id=trades.market_id AND p.status='RESOLVED'
                             ORDER BY p.closed_at DESC LIMIT 1)
-            WHERE leg='TAKER' AND status='OPEN'
+            WHERE leg IN ('TAKER', 'CERT_LIVE') AND status='OPEN'
               AND EXISTS (SELECT 1 FROM positions p
                           WHERE p.market_id=trades.market_id AND p.status='RESOLVED')
         """, (time.time(),))
@@ -394,7 +394,7 @@ def reconcile_taker_ledger() -> int:
         # not left dangling OPEN in the history.
         conn.execute("""
             UPDATE trades SET status='CANCELLED', outcome='CANCELLED', closed_at=?
-            WHERE leg='TAKER' AND status='OPEN'
+            WHERE leg IN ('TAKER', 'CERT_LIVE') AND status='OPEN'
               AND EXISTS (SELECT 1 FROM positions p
                           WHERE p.market_id=trades.market_id AND p.status='CANCELLED')
         """, (time.time(),))
@@ -470,7 +470,7 @@ def resolve_taker_ledger(market_id: str, outcome: str, pnl: float):
     with _conn() as conn:
         conn.execute("""
             UPDATE trades SET status = 'RESOLVED', outcome = ?, pnl_usdc = ?, closed_at = ?
-            WHERE market_id = ? AND leg = 'TAKER' AND status = 'OPEN'
+            WHERE market_id = ? AND leg IN ('TAKER', 'CERT_LIVE') AND status = 'OPEN'
         """, (outcome, pnl, time.time(), market_id))
 
 
