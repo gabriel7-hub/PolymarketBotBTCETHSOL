@@ -53,6 +53,34 @@ def start_dashboard_server(bot_state_fn, toggle_fn=None):
         logger.warning(f"Dashboard server could not start: {exc}")
 
 
+class WindowExposureGuard:
+    """Cross-asset correlation guard shared by all AssetWorkers (config.CERTAINTY_CORR_*).
+
+    The 4 assets move together, so several same-direction certainty bets in one window are one
+    correlated bet at N× size. This bounds the TOTAL same-side live certainty STAKE per (window,
+    side) to a budget, so an all-asset wipeout is capped while breadth (taking all agreeing assets)
+    is preserved. Each asset requests its fair share; the guard grants up to the remaining budget.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._used: dict[tuple, float] = {}   # (start_ts, side) -> stake $ already reserved
+
+    def reserve_stake(self, start_ts: int, side: str, want: float, budget: float) -> float:
+        """Reserve up to `want` of the (window, side) budget. Returns the granted stake ($)."""
+        with self._lock:
+            # prune windows older than ~1h so the map stays bounded
+            cutoff = start_ts - 3600
+            for k in [k for k in self._used if k[0] < cutoff]:
+                del self._used[k]
+            key = (start_ts, side)
+            used = self._used.get(key, 0.0)
+            grant = max(0.0, min(want, budget - used))
+            if grant > 0:
+                self._used[key] = used + grant
+            return grant
+
+
 class AssetWorker:
     """
     Everything one asset needs to trade its 5-min Up/Down market, isolated from the
@@ -61,12 +89,16 @@ class AssetWorker:
     """
 
     def __init__(self, asset: str, paper_mode: bool = True,
-                 live_halt: Optional[threading.Event] = None):
+                 live_halt: Optional[threading.Event] = None,
+                 corr_guard: Optional["WindowExposureGuard"] = None):
         self.asset = asset
         self.paper_mode = paper_mode
         # Shared across all workers: when SET, no new LIVE orders are placed (dashboard kill
         # switch). Open positions still resolve normally. Paper mode ignores it.
         self.live_halt = live_halt if live_halt is not None else threading.Event()
+        # Shared cross-asset correlation guard (caps simultaneous same-side LIVE certainty bets
+        # per window). A per-worker fallback keeps single-asset runs working standalone.
+        self.corr_guard = corr_guard if corr_guard is not None else WindowExposureGuard()
 
         self.discovery = MarketDiscovery(asset)
         self.binance   = BinanceFeed(asset)
@@ -93,6 +125,9 @@ class AssetWorker:
         self._late_mom_session: float = 0.0      # paper P&L of the experimental late-mom leg
         self._cert_shadow: dict[int, dict] = {}  # start_ts -> open certainty/feed-lag shadow bet
         self._cert_shadow_session: float = 0.0   # paper P&L of the certainty shadow leg
+        self._maker_pending: dict[int, dict] = {} # start_ts -> resting maker-first cert limit (paper)
+        self._cert_slip_sum: float = 0.0         # Σ(fill − displayed ask) over cert fills — fill-quality
+        self._cert_slip_n: int = 0               # count, for avg realized slippage (London A/B telemetry)
         self._box_shadow: dict[int, dict] = {}   # start_ts -> open certainty BOX hedge (shadow)
         self._box_shadow_session: float = 0.0    # cumulative counterfactual P&L impact of boxing
         self._box_adv_run: dict[int, float] = {} # start_ts -> ts the adverse run began (box de-noise)
@@ -345,18 +380,55 @@ class AssetWorker:
                 # asks (the STRIKE-MISSED bug). The real taker/late-mom legs gate on this too.
                 if (window.has_reference
                         and self.asset in config.CERTAINTY_ASSETS
-                        and start_ts not in self._cert_shadow):
+                        and start_ts not in self._cert_shadow
+                        and start_ts not in self._maker_pending):
                     pick = self.engine.certainty_shadow(signal)
-                    if pick is not None and not self.paper_mode:
+                    if (pick is not None and not self.paper_mode
+                            and self.asset in config.CERTAINTY_LIVE_ASSETS):
                         # ── LIVE certainty order ──────────────────────────────────────────
-                        # Real USDC. Gated by (1) the dashboard kill switch and (2) the
-                        # per-asset risk guard (open-position + global daily-loss halt). Opens
-                        # a real position resolved by _resolve_position; a sentinel in
-                        # _cert_shadow stops the gate from re-firing this window.
+                        # Real USDC — ONLY for assets on the CERTAINTY_LIVE_ASSETS whitelist (SOL).
+                        # Any other asset that fires the leg in live mode falls to the paper branch
+                        # below. Gated further by (1) the dashboard kill switch and (2) the per-asset
+                        # risk guard (open-position + global daily-loss halt). Opens a real position
+                        # resolved by _resolve_position; a sentinel in _cert_shadow stops the gate
+                        # from re-firing this window.
                         cside, cask, csize = pick
+                        # Cross-asset correlation guard (combined STAKE cap): the 4 assets move
+                        # together, so reserve this asset's fair share (budget / #live-assets) of a
+                        # per-(window, side) budget. Breadth is kept — every agreeing asset still
+                        # trades — but the TOTAL same-side stake (hence an all-asset wipeout) is
+                        # bounded. SOL-only ⇒ share = full budget, capped at base ⇒ no-op today.
+                        if config.CERTAINTY_CORR_GUARD_ENABLED:
+                            n_live = max(1, len(config.CERTAINTY_LIVE_ASSETS))
+                            want = min(csize, config.CERTAINTY_CORR_STAKE_USDC / n_live)
+                            csize = self.corr_guard.reserve_stake(
+                                start_ts, cside, want, config.CERTAINTY_CORR_STAKE_USDC)
                         if self.live_halt.is_set():
                             logger.info(f"[LIVE·CERT][{self.asset}] skip — LIVE trading "
                                         f"STOPPED (dashboard kill switch)")
+                        elif csize < config.CERTAINTY_MIN_ORDER_USDC:
+                            # Below the Polymarket minimum order (budget exhausted or share too
+                            # small) — placing it would error. Record paper so analysis sees it.
+                            logger.info(f"[LIVE·CERT][{self.asset}] skip — share ${csize:.2f} "
+                                        f"< min order ${config.CERTAINTY_MIN_ORDER_USDC:.2f} "
+                                        f"({cside}, correlation budget "
+                                        f"${config.CERTAINTY_CORR_STAKE_USDC:.2f}) → paper")
+                            # Budget gone for real capital, but still record the paper shadow so
+                            # the analysis sees the full opportunity set (and the guard's cost).
+                            entry, shares = cask, pick[2] / cask
+                            if config.PAPER_FILL_REALISM and self.book is not None:
+                                tick = float(getattr(window, "tick_size", None) or config.TICK_SIZE)
+                                filled, vwap = self.book.fill_ask(cside, shares)
+                                if filled > 0:
+                                    entry = min(0.99, vwap + config.PAPER_SLIPPAGE_TICKS * tick)
+                                    shares = filled
+                                else:
+                                    shares = 0
+                            if shares > 0:
+                                self._open_cert_paper(window, start_ts, cside, cask, entry, shares,
+                                                      maker=False, label="corr-guard",
+                                                      t_fired=signal.time_remaining,
+                                                      p_up=signal.p_up)
                         else:
                             ok, why = self.risk.check()
                             if not ok:
@@ -368,47 +440,53 @@ class AssetWorker:
                                     self._pending[start_ts] = window.condition_id
                     elif pick is not None:
                         cside, cask, csize = pick
-                        # Depth-realistic fill: DECIDE on the displayed ask, FILL by walking
-                        # the live book (VWAP) + one adverse latency tick — the very realism
-                        # the backtest could not model from top-of-book ticks. A too-thin /
-                        # empty ask book means no fill (we don't manufacture liquidity).
-                        # csize = confidence-scaled paper notional (late slice gets more).
-                        entry, shares = cask, csize / cask
-                        if config.PAPER_FILL_REALISM and self.book is not None:
+                        if config.CERTAINTY_MAKER_ENABLED:
+                            # Maker-first (the execution lever): rest a buy limit one tick below the
+                            # displayed ask instead of crossing now. It fills as a MAKER only if the
+                            # book trades down to it within the wait window (_check_maker_fills);
+                            # otherwise it crosses to a taker fill at the deadline. Captures the
+                            # adverse selection a perfect-maker sim assumes away.
                             tick = float(getattr(window, "tick_size", None) or config.TICK_SIZE)
-                            filled, vwap = self.book.fill_ask(cside, shares)
-                            if filled <= 0:
-                                logger.info(f"[PAPER·SHADOW][{self.asset}] certainty {cside} "
-                                            f"unfilled — ask book empty/too thin")
-                                filled = 0
-                            else:
-                                entry = min(0.99, vwap + config.PAPER_SLIPPAGE_TICKS * tick)
-                                shares = filled
-                        else:
-                            filled = shares
-                        if filled > 0:
-                            tid = state.record_trade({
-                                "asset": self.asset,
-                                "market_id": window.condition_id, "start_ts": start_ts,
-                                "leg": "CERTAINTY", "side": cside, "price": round(entry, 4),
-                                "detail": f"CERTAINTY {cside} ask={cask:.2f} fill={entry:.3f} "
-                                          f"p={signal.p_up:.3f} T-{signal.time_remaining:.0f}s "
-                                          f"(paper shadow)",
-                                "size_usdc": round(shares * entry, 2),
-                                "status": "OPEN", "outcome": None,
-                            })
-                            self._cert_shadow[start_ts] = {
-                                "side": cside, "price": entry, "shares": shares,
-                                "trade_id": tid,
+                            limit = round(max(tick, cask - config.CERTAINTY_MAKER_OFFSET_TICKS * tick), 4)
+                            self._maker_pending[start_ts] = {
+                                "side": cside, "limit": limit, "size_usdc": csize, "cask": cask,
+                                "deadline": time.time() + config.CERTAINTY_MAKER_WAIT_SECS,
+                                "p_up": signal.p_up, "t_fired": signal.time_remaining,
+                                "condition_id": window.condition_id,
                             }
-                            # Guarantee the window gets resolved even if no real taker fires
-                            # and the 1s loop misses the close tick — otherwise this shadow row
-                            # hangs OPEN forever (it fires far from close, at t-45..220s).
                             if start_ts not in self._resolved:
                                 self._pending[start_ts] = window.condition_id
-                            logger.info(f"[PAPER·SHADOW][{self.asset}] certainty "
-                                        f"{cside} ask={cask:.2f} fill={entry:.3f} "
-                                        f"sh={shares:.1f}")
+                            logger.info(f"[PAPER·MAKER][{self.asset}] certainty {cside} "
+                                        f"rest limit@{limit:.3f} (ask={cask:.2f}) "
+                                        f"T-{signal.time_remaining:.0f}s, wait "
+                                        f"{config.CERTAINTY_MAKER_WAIT_SECS:.0f}s")
+                        else:
+                            # Depth-realistic fill: DECIDE on the displayed ask, FILL by walking
+                            # the live book (VWAP) + one adverse latency tick — the very realism
+                            # the backtest could not model from top-of-book ticks. A too-thin /
+                            # empty ask book means no fill (we don't manufacture liquidity).
+                            # csize = confidence-scaled paper notional (late slice gets more).
+                            entry, shares = cask, csize / cask
+                            if config.PAPER_FILL_REALISM and self.book is not None:
+                                tick = float(getattr(window, "tick_size", None) or config.TICK_SIZE)
+                                filled, vwap = self.book.fill_ask(cside, shares)
+                                if filled <= 0:
+                                    logger.info(f"[PAPER·SHADOW][{self.asset}] certainty {cside} "
+                                                f"unfilled — ask book empty/too thin")
+                                    filled = 0
+                                else:
+                                    entry = min(0.99, vwap + config.PAPER_SLIPPAGE_TICKS * tick)
+                                    shares = filled
+                            else:
+                                filled = shares
+                            if filled > 0:
+                                self._open_cert_paper(window, start_ts, cside, cask, entry,
+                                                      filled, maker=False, label="",
+                                                      t_fired=signal.time_remaining,
+                                                      p_up=signal.p_up)
+
+                # Maker-first: settle / cross any resting cert limit against the live book.
+                self._check_maker_fills(signal, window, start_ts)
 
                 # Box-stop: hedge the open taker into a $1 box if the signal flipped.
                 self._maybe_box_position(signal, window)
@@ -636,11 +714,80 @@ class AssetWorker:
                     f"{'WIN' if won else 'LOSS'} pnl={pnl:+.2f} "
                     f"(session {self._late_mom_session:+.2f})")
 
+    def _open_cert_paper(self, window, start_ts, side, cask, entry, shares,
+                         *, maker: bool, label: str, t_fired: float, p_up: float = 0.0):
+        """Record an open paper CERTAINTY shadow row + register it for resolution. Shared by the
+        immediate-taker path and the maker-first fill path. `maker` flags a maker fill (no taker
+        fee, resolved fee-free in _resolve_cert_shadow); `label` tags the fill kind in the detail."""
+        if shares <= 0:
+            return
+        tag = f" {label}" if label else ""
+        tid = state.record_trade({
+            "asset": self.asset,
+            "market_id": window.condition_id, "start_ts": start_ts,
+            "leg": "CERTAINTY", "side": side, "price": round(entry, 4),
+            "detail": f"CERTAINTY {side}{tag} ask={cask:.2f} fill={entry:.3f} "
+                      f"p={p_up:.3f} T-{t_fired:.0f}s (paper shadow)",
+            "size_usdc": round(shares * entry, 2),
+            "status": "OPEN", "outcome": None,
+        })
+        self._cert_shadow[start_ts] = {
+            "side": side, "price": entry, "shares": shares, "trade_id": tid, "maker": maker,
+        }
+        if start_ts not in self._resolved:
+            self._pending[start_ts] = window.condition_id
+        # Fill-quality telemetry: realized slippage vs the displayed ask, in cents. This is the number
+        # the London migration is meant to shrink (Bangalore taker pays ~+1 tick; closer to the engine
+        # ⇒ less adverse movement before the fill). Tracked as a running average for the dashboard.
+        slip_c = (entry - cask) * 100.0
+        self._cert_slip_sum += (entry - cask)
+        self._cert_slip_n += 1
+        logger.info(f"[PAPER·SHADOW][{self.asset}] certainty {side}{tag} ask={cask:.2f} "
+                    f"fill={entry:.3f} slip={slip_c:+.1f}c sh={shares:.1f}")
+
+    def _check_maker_fills(self, signal, window, start_ts: int):
+        """Settle a resting maker-first cert limit against the live book each tick. It fills as a
+        MAKER (at the limit, fee=0) only if the book's ask has traded DOWN to our price — which is
+        disproportionately when the favorite is weakening, so adverse selection is captured, not
+        assumed away. If the wait deadline passes unfilled, CROSS to a depth-realistic taker fill
+        (current ask VWAP + 1 adverse tick), i.e. today's behavior. Paper-only."""
+        mk = self._maker_pending.get(start_ts)
+        if not mk:
+            return
+        side = mk["side"]
+        ask = signal.up_ask if side == "UP" else signal.down_ask
+        # MAKER fill: the book traded through our resting limit.
+        if ask is not None and ask <= mk["limit"]:
+            self._maker_pending.pop(start_ts, None)
+            shares = mk["size_usdc"] / mk["limit"]
+            self._open_cert_paper(window, start_ts, side, mk["cask"], mk["limit"], shares,
+                                  maker=True, label="MAKER", t_fired=mk["t_fired"],
+                                  p_up=mk["p_up"])
+            return
+        # Deadline: cross to a taker fill (depth-realistic VWAP + adverse tick).
+        if time.time() >= mk["deadline"]:
+            self._maker_pending.pop(start_ts, None)
+            cask_now = ask if ask is not None else mk["cask"]
+            shares = mk["size_usdc"] / cask_now
+            entry = cask_now
+            if config.PAPER_FILL_REALISM and self.book is not None:
+                tick = float(getattr(window, "tick_size", None) or config.TICK_SIZE)
+                filled, vwap = self.book.fill_ask(side, shares)
+                if filled <= 0:
+                    logger.info(f"[PAPER·MAKER][{self.asset}] certainty {side} cross unfilled "
+                                f"— ask book empty/too thin; limit canceled")
+                    return
+                entry, shares = min(0.99, vwap + config.PAPER_SLIPPAGE_TICKS * tick), filled
+            self._open_cert_paper(window, start_ts, side, cask_now, entry, shares,
+                                  maker=False, label="TAKER-cross", t_fired=mk["t_fired"],
+                                  p_up=mk["p_up"])
+
     def _resolve_cert_shadow(self, start_ts: int, winning_side: str):
         """Settle the certainty/feed-lag shadow bet for a window (paper-only). Isolated from
         the real position lifecycle — scores its own ledger row + a session tally so the leg's
         live (depth-realistic) P&L can be compared against the backtest. Authoritative number
         is still backtest.py --certainty on REAL outcomes."""
+        self._maker_pending.pop(start_ts, None)   # cancel any limit still resting at close
         cs = self._cert_shadow.pop(start_ts, None)
         if not cs:
             return
@@ -650,7 +797,9 @@ class AssetWorker:
         entry = cs["price"]
         shares = cs.get("shares") or (config.CERTAINTY_SIZE_USDC / entry)
         won = (cs["side"] == winning_side)
-        fee = pricing.taker_fee_per_share(entry) * shares
+        # Maker fills pay NO taker fee (maker fee = 0); the 5-min reward pool is unfunded so there
+        # is no rebate either, but skipping the taker fee is itself part of the maker lever's edge.
+        fee = 0.0 if cs.get("maker") else pricing.taker_fee_per_share(entry) * shares
         # The certainty leg always settles on its un-boxed ride; the boxed hedge is recorded as a
         # separate, VISIBLE-but-uncounted CERTAINTY_BOX row in _resolve_box_shadow (it shows in the
         # Trade History but is excluded from session/total P&L by design — see config note).
@@ -986,6 +1135,10 @@ class AssetWorker:
                 "cert_shadow_enabled": config.CERTAINTY_SHADOW_ENABLED,
                 "cert_shadow_open": len(self._cert_shadow),
                 "cert_shadow_session": round(self._cert_shadow_session, 2),
+                "maker_pending": len(self._maker_pending),
+                "cert_avg_slip_cents": (round(100.0 * self._cert_slip_sum / self._cert_slip_n, 2)
+                                        if self._cert_slip_n else 0.0),
+                "cert_fills": self._cert_slip_n,
                 "box_shadow_enabled": config.CERTAINTY_BOX_ENABLED,
                 "box_shadow_open": len(self._box_shadow),
                 "box_shadow_session": round(self._box_shadow_session, 2),
@@ -1031,7 +1184,11 @@ class BotRunner:
         # One shared kill switch for every worker — flipped from the dashboard. When SET,
         # workers place no new LIVE orders; open positions still resolve.
         self.live_halt = threading.Event()
-        self.workers = {a: AssetWorker(a, paper_mode=paper_mode, live_halt=self.live_halt)
+        # One shared cross-asset correlation guard — caps simultaneous same-side LIVE certainty
+        # bets across assets per window (fake-diversification protection).
+        self.corr_guard = WindowExposureGuard()
+        self.workers = {a: AssetWorker(a, paper_mode=paper_mode, live_halt=self.live_halt,
+                                       corr_guard=self.corr_guard)
                         for a in config.ASSETS}
         self._dash_state: dict = {}
         self._last_maintenance = time.time()

@@ -287,17 +287,30 @@ CERTAINTY_SHADOW_ENABLED = True    # master switch (paper-only effect). False = 
 #   BTC+ETH : PF 1.06 / win 88.7% / EV ~0       (carries adverse-selection risk for no edge)
 # So the leg only fires on the assets below; BTC/ETH still trade/record everything else but skip
 # the certainty shadow. Revisit if BTC/ETH accumulate a PF>=1.5 sample. Validated 2026-06-24.
-# 2026-06-26: user opted to run ALL FOUR assets LIVE on one shared bankroll. NOTE (evidence):
-# BTC/ETH certainty is ~breakeven (PF ~1.06-1.14, <1pt win-rate cushion) and losses are
-# CORRELATED across assets (one window flipped all four at once for -$102 on paper), so adding
-# BTC/ETH amplifies the simultaneous-loss tail rather than diversifying it. The dashboard kill
-# switch is the safety valve. Revert to ("SOL","XRP") to run only the gate-clearing assets.
-CERTAINTY_ASSETS = ("BTC", "ETH", "SOL", "XRP")  # assets the certainty leg fires on (paper & live)
+# 2026-06-28: GATED TO SOL — the only asset with a survivorship-free edge. Three independent lines
+# of evidence converge: (1) post-22 backtest realistic fills SOL +$100/PF 1.12 vs BTC −$303/ETH −$317;
+# (2) BTC/ETH stay NEGATIVE even at perfect "touch" fills (latency/London cannot rescue them);
+# (3) apples-to-apples reconciliation of the live dashboard vs backtest — the live +P&L on BTC/ETH/XRP
+# was SURVIVORSHIP (bot traded 622/1206 windows @ 92.4% vs the true 86.7% pop = −$637), only SOL was
+# positive in BOTH. XRP is marginal (backtest ~breakeven, live +$206 was a 97.7%/86-trade streak) — it
+# can be re-added if it clears on London-tightened fills. NOTE: this gates only the certainty SHADOW;
+# `_record_tick` still records ticks for ALL config.ASSETS, so the BTC/ETH/XRP London A/B backtest is
+# fully preserved. See memory dashboard-pnl-survivorship-bias / certainty-asset-gate-sol-xrp.
+CERTAINTY_ASSETS = ("BTC", "ETH", "SOL", "XRP")   # leg fires on all 4 (paper & live) — all-asset go-live 2026-06-28
+# Live-capital whitelist: in --mode live, ONLY these assets place REAL orders; any other asset that
+# fires the leg falls through to a paper shadow even in live mode. 2026-06-28: WIDENED to all 4 at
+# the user's direction (was SOL-only). RISK NOTE: SOL is the only survivorship-free edge; XRP was the
+# only NEGATIVE-edge asset on fresh on-chain data and BTC/ETH are marginal — the cross-asset stake
+# guard below (bounds an all-4 same-side loss to CERTAINTY_CORR_STAKE_USDC) is the safety belt that
+# makes this defensible. Watch XRP's live P&L closely. See certainty-asset-gate-sol-xrp / golive-sol-only.
+CERTAINTY_LIVE_ASSETS = ("BTC", "ETH", "SOL", "XRP")
 CERTAINTY_FLOOR      = 0.80        # min model prob for the side to count as "certain"
 CERTAINTY_LAG_MARGIN = 0.03        # min book lag (p_side − ask) required to enter
 CERTAINTY_MAX_ASK    = 0.97        # never buy above this — taker fee eats the edge past here
-CERTAINTY_MIN_ASK    = 0.82        # never buy BELOW this — see note. Validated 2026-06-22.
+CERTAINTY_MIN_ASK    = 0.78        # never buy BELOW this. Lowered 0.82→0.78 (2026-06-28) — see note.
 CERTAINTY_SIZE_USDC  = 1.5         # base notional per certainty bet ($1.5 live tranche 2026-06-27)
+CERTAINTY_MIN_ORDER_USDC = 1.0     # Polymarket minimum order ($1); never place a live order below this
+#                                    (a guard-reduced share under $1 falls through to a paper shadow)
 # CERTAINTY_MIN_ASK: only enter when the BOOK already prices the favorite ≥ this. A large
 # model-vs-book gap (model 0.90 while the book sits near 0.50) is NOT feed-lag — it is model
 # overconfidence against a fairly-priced book, and those entries LOSE under realistic fills.
@@ -305,9 +318,33 @@ CERTAINTY_SIZE_USDC  = 1.5         # base notional per certainty bet ($1.5 live 
 # Validation (recovered bot_state.db, 1,671 REAL windows, realistic +1-tick fill, OOS 70/30):
 #   no floor       : full PF 0.93 / OOS PF 0.92  (net-negative — the live bleed)
 #   ask ≥ 0.82     : full PF 1.07 / OOS PF 1.09-1.18; per-asset BTC 1.18 ETH 1.11 (was 0.70) SOL 0.99
-# Still < the 1.5 live gate, so the leg stays PAPER-ONLY; this only stops the measured bleed.
+# REFINED 2026-06-28: a fine sub-floor sweep (analyze_barbell, full DB, cert leg) found the real edge
+# CLIFF is at 0.78, not 0.82 — the old floor over-corrected and discarded a profitable band:
+#   0.70-0.78 : 67-74% win, net edge -3 to -6  → -$142  (model overconfidence — STILL excluded)
+#   0.78-0.80 : 86.8% win,  net edge +7.0      → +$74
+#   0.80-0.82 : 87.2% win,  net edge +5.3      → +$25
+# Realized win% AT a given book ask is a market property (book underprices favorites here, 87% vs
+# ~79% breakeven), so it is more model-independent / robust than the rejected barbell. Hence floor
+# lowered to 0.78. CAVEAT: the 0.78-0.82 sample is modest (77 trades, mostly pre-recal; n=22 post-recal
+# @ 90.9%/+$21) — monitor with `analyze_barbell.py --leg CERT_LIVE` and raise back if it regresses.
+# Do NOT go below 0.78: sub-0.78 is the validated bleed zone. (A model-vs-book gap CAP was separately
+# tried and REJECTED, PF→0.85.) Bonus: cheaper entries also shrink the "1 loss eats N wins" ratio.
 # REJECTED by the same validation: a model-vs-book gap CAP (hurt, PF→0.85) and firing only in
 # the last ≤45s (non-monotonic; ≤45s was net-negative here, unlike the older 8,044-window DB).
+
+# ─── Entry-price BARBELL gate (2026-06-28) — TESTED AND REJECTED, kept OFF for the record ──
+# Hypothesis from 733 REAL on-chain trades (J27+J28, data-api /activity, resolved via Gamma):
+# entry win% vs breakeven looked like a BARBELL — edge in 0.78-0.85 and 0.91-0.97, with the
+# 0.85-0.91 "murky middle" a fee-funded NET LOSER (-$13). It did NOT replicate: analyze_barbell.py
+# on the full DB (4,191 cert trades) shows 0.85-0.91 is solidly POSITIVE (net_edge +3.6 / +2.3pts,
+# +$1,572) and the curve is ~monotonic — the only band that loses in BOTH samples is the <0.78
+# longshot tail, which CERTAINTY_MIN_ASK=0.82 already excludes. Skipping the middle would DELETE
+# edge. So the gate stays OFF. The 2-day barbell was small-sample noise (~1 SE per bucket) — a
+# textbook reminder to validate on the larger sample before acting. Re-enable only if a large,
+# bias-free REAL sample reproduces it (check with analyze_barbell.py). See longshot-tail-miscalibration.
+CERTAINTY_BARBELL_ENABLED = False
+CERTAINTY_DEAD_ASK_LO = 0.85       # skip entries with DEAD_LO <= ask < DEAD_HI (only if ENABLED)
+CERTAINTY_DEAD_ASK_HI = 0.91
 
 # Zone: the certainty edge is CONCENTRATED IN THE LAST 10-45s, not the mid-window. Probe
 # (sy/cert_zone_experiment.py, recovered DB, realistic +1-tick fill, 2026-06-21):
@@ -327,12 +364,52 @@ CERTAINTY_ZONE_END   = 10          # secs remaining: gate stops at/below this (e
 # 2.57 at 10bp) by skipping the near-boundary windows where the favorite can still flip.
 CERTAINTY_MIN_MOVE_BP = 5.0
 
+# ─── Cross-asset CORRELATION guard (2026-06-28) ───────────────────────────────────────────
+# The 4 assets move together, so N simultaneous same-direction certainty bets in one 5-min window
+# are really ONE bet at N× size — fake diversification. Measured (4,191 cert trades): windows where
+# >=2 assets lost together = 44% of ALL loss dollars; 4 windows lost all four; worst window -$102.
+#
+# Design = COMBINED STAKE CAP (not a count cap): bound the TOTAL same-side live certainty stake per
+# window to CERTAINTY_CORR_STAKE_USDC, split equally across the live universe. Each firing asset
+# requests its fair share (budget / #live-assets), capped at its base size; the guard grants up to
+# the remaining budget. This keeps BREADTH — when all 4 agree and WIN, you still win all 4 (smaller
+# size each) instead of forgoing the 3rd/4th (which historically win 92.4%) — while an all-4-LOSS is
+# bounded to the budget. With SOL-only live (1 asset) the share = full budget, capped at base, so it
+# is a NO-OP today; it only reshapes sizing once CERTAINTY_LIVE_ASSETS widens. Trade-off: in a
+# multi-asset-live regime a window where only ONE asset fires is sized at its fair share, not full
+# base (conservative under-bet on uncorrelated windows — tune the budget when you go multi-live).
+# Only the LIVE order path is constrained; paper shadows still record every fire for analysis.
+# Budget = $4 with 4 live assets ⇒ $1 each (the Polymarket minimum) when all 4 agree, total $4/window
+# same-side; all-4 WIN takes all four, all-4 LOSS bounded to -$4. A share that would round below
+# CERTAINTY_MIN_ORDER_USDC is not placed live (→ paper) — so keep budget ≥ #live × $1.
+CERTAINTY_CORR_GUARD_ENABLED = True
+CERTAINTY_CORR_STAKE_USDC    = 4.0    # max TOTAL same-side live certainty stake across assets / window
+
 # Confidence sizing (P3): in the validated late slice the edge is large and low-variance, so
 # size up there instead of flat $25. Stake = base, bumped to LATE_SIZE inside the late zone
 # when the move gate is strongly cleared. Capped by CERTAINTY_MAX_SIZE_USDC. Paper-only effect.
 CERTAINTY_LATE_FROM   = 45         # secs remaining at/below which "late-slice" sizing applies
 CERTAINTY_LATE_SIZE_USDC = 1.5     # flat $1.5 (late 2x dropped)
 CERTAINTY_MAX_SIZE_USDC  = 1.5     # hard cap on any single certainty bet
+
+# ─── Maker-first entry (PAPER) — the execution lever ────────────────────────────────────
+# 2026-06-28. Measured finding (recovered.db, 1,665 trades): the certainty leg's P&L is almost
+# entirely a function of FILL price, not signal — taker (+1 adverse tick) = −$693 / PF 0.87, while
+# a maker fill (−1 tick) = +$213 / PF 1.04 (each 1c of fill ≈ $453 / ~$0.27/trade). The +$213 is an
+# UPPER BOUND, though: a resting limit fills only when the book trades through it — which is
+# disproportionately when the favorite is WEAKENING (adverse selection — retired thesis #1). So this
+# models the REALISTIC recoverable middle: when the gate fires we POST a limit at ask − OFFSET ticks
+# for WAIT secs; it fills (as a MAKER, fee=0) ONLY if the live book actually trades down to our price
+# within the window; otherwise we CROSS and take at the current ask + 1 tick (today's behavior). The
+# adverse-selection bias is captured, not assumed away. PAPER-only; live entry path is unchanged.
+# 2026-06-28: DISABLED. The realistic offline test landed at −$705 ≈ pure taker (only 22% fill as
+# maker, and those are the losers: PF 0.84). It does not recover P&L AND it muddies the clean
+# before/after taker-fill measurement we need for the London migration. Keep it as a pure TAKER
+# baseline so the London latency improvement (tighter taker fills) is cleanly attributable. Code is
+# retained; flip back to True only to re-measure the maker path. See maker-first-adverse-selection.
+CERTAINTY_MAKER_ENABLED      = False
+CERTAINTY_MAKER_OFFSET_TICKS = 1     # rest the buy limit this many ticks below the displayed ask
+CERTAINTY_MAKER_WAIT_SECS    = 2.0   # how long the limit rests before crossing to a taker fill
 
 # ─── CERTAINTY box-stop (SHADOW: measures the loss-capping hedge, never places it) ──────
 # 2026-06-27. On ~/Downloads/bot_state.db (1759 resolved cert trades) a hedge-to-box on an

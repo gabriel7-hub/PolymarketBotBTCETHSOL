@@ -297,6 +297,11 @@ class SignalEngine:
             return None
         if ask < config.CERTAINTY_MIN_ASK:                 # book disagrees too much — model error, not lag
             return None
+        # Barbell: skip the 0.85-0.91 "murky middle" — fee-funded net loser on the real on-chain
+        # fills (J27+J28). Edge lives in the cheap-favorite and near-lock bands. See config note.
+        if config.CERTAINTY_BARBELL_ENABLED and \
+           config.CERTAINTY_DEAD_ASK_LO <= ask < config.CERTAINTY_DEAD_ASK_HI:
+            return None
         if (p_side - ask) < config.CERTAINTY_LAG_MARGIN:   # book hasn't lagged enough
             return None
         if pricing.taker_ev_per_share(p_side, ask) < 0:    # not fee-net positive
