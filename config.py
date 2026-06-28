@@ -363,6 +363,10 @@ CERTAINTY_BOX_FRACTION    = 1.0
 CERTAINTY_BOX_CREDIT      = False
 CERTAINTY_BOX_CREDIT_MAX  = 0.99   # box if entry + opp_ask ≤ this (locks ≥1¢/pair)
 CERTAINTY_BOX_CREDIT_FROM = 70     # credit box may fire in the last N secs (winners' ~70s window)
+# The boxed hedge is recorded as its own leg='CERTAINTY_BOX' trade row — VISIBLE in the dashboard
+# Trade History (rendered as BOX·SHADOW) — but its P&L is deliberately kept OUT of the session and
+# total P&L counters (every ledger aggregate filters to leg='CERTAINTY'). So the certainty leg's
+# headline P&L always reflects the un-boxed ride; the box row is a visible-but-uncounted measurement.
 
 # ─── Fee Constants (Fee Structure V2, effective Mar 30 2026) ───────────────────
 # Crypto taker fee = C × 0.07 × p × (1−p), per share. Makers pay zero.

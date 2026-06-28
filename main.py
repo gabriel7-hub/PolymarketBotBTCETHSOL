@@ -651,6 +651,9 @@ class AssetWorker:
         shares = cs.get("shares") or (config.CERTAINTY_SIZE_USDC / entry)
         won = (cs["side"] == winning_side)
         fee = pricing.taker_fee_per_share(entry) * shares
+        # The certainty leg always settles on its un-boxed ride; the boxed hedge is recorded as a
+        # separate, VISIBLE-but-uncounted CERTAINTY_BOX row in _resolve_box_shadow (it shows in the
+        # Trade History but is excluded from session/total P&L by design — see config note).
         pnl = ((1.0 - entry) if won else -entry) * shares - fee
         state.update_trade(cs["trade_id"], status="RESOLVED",
                            outcome=("WIN" if won else "LOSS"),
@@ -804,7 +807,8 @@ class AssetWorker:
         self._box_shadow_session += saved
         logger.info(f"[BOX·SHADOW][{self.asset}] {box.get('kind','?')} resolved: ride "
                     f"{long_pnl:+.2f} vs boxed {boxed:+.2f} (saved {saved:+.2f}; "
-                    f"session {self._box_shadow_session:+.2f})")
+                    f"box row visible in Trade History, excluded from session/total P&L; "
+                    f"box-impact tally {self._box_shadow_session:+.2f})")
 
     def _maybe_box_position(self, signal, window):
         """
