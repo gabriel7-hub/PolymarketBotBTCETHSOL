@@ -52,6 +52,30 @@ def http_timing(host, path="/", samples=8):
           f"tls_handshake={md(tls):6.1f}  ttfb_after_connect={md(ttfb):6.1f}  (ms, median)")
 
 
+def origin_rtt(host, path, samples=10):
+    """TTFB on a tiny DYNAMIC endpoint over a kept-alive connection — reuses one TLS session so the
+    number is ~pure request→origin→response. The closer this is to your TCP-connect RTT, the closer
+    your VPS is to Polymarket's origin matching engine (London edge ≈2ms but origin TTFB ≈98ms ⇒
+    origin is ~96ms away, i.e. US-East — a US VPS would cut this further)."""
+    try:
+        ip = socket.gethostbyname(host)
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(host, 443, timeout=5, context=ctx)
+        conn.connect()
+        rtts = []
+        for _ in range(samples):
+            s = time.perf_counter()
+            conn.request("GET", path)
+            r = conn.getresponse(); r.read()
+            rtts.append((time.perf_counter() - s) * 1e3)
+        conn.close()
+        rtts.sort()
+        print(f"  {host}{path:10} min={rtts[0]:6.1f}  median={statistics.median(rtts):6.1f}  "
+              f"max={rtts[-1]:6.1f}  (ms) — origin matching-engine round-trip")
+    except Exception as e:
+        print(f"  {host}{path}: error {e}")
+
+
 def ws_ping_rtt(url, n=20):
     """Connect to the CLOB market socket, send {"type":"PING"} n times, time each PONG."""
     try:
@@ -109,6 +133,8 @@ def main():
     print("HTTP round-trip (order-placement path):")
     for h in REST_HOSTS:
         http_timing(h)
+    print("\nOrigin RTT (DYNAMIC endpoint, not edge-cached — isolates distance to the matching engine):")
+    origin_rtt("clob.polymarket.com", "/time")
     print("\nWebSocket round-trip (book-feed path):")
     ws_ping_rtt(WS_URL, args.pings)
     print("\nNext: compare these on the OLD vs NEW host, then confirm with "
