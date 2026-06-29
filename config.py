@@ -401,8 +401,17 @@ CERTAINTY_MIN_MOVE_BP = 5.0
 # Budget = $4 with 4 live assets ⇒ $1 each (the Polymarket minimum) when all 4 agree, total $4/window
 # same-side; all-4 WIN takes all four, all-4 LOSS bounded to -$4. A share that would round below
 # CERTAINTY_MIN_ORDER_USDC is not placed live (→ paper) — so keep budget ≥ #live × $1.
-CERTAINTY_CORR_GUARD_ENABLED = True
-CERTAINTY_CORR_STAKE_USDC    = 4.0    # max TOTAL same-side live certainty stake across assets / window
+# 2026-06-29: DISABLED at the user's direction — they want each position at the FULL base size
+# ($1.5), NOT reduced to budget/#assets ($1 each). Side effect this fixes: when all assets fired
+# the shared $4 budget drained (worse with FAK-failure retries that still reserve), so the last
+# asset's grant rounded to $0 < $1 min order and fell to a PAPER shadow — which still shows in the
+# dashboard Trade History but never reaches Polymarket (the "frontend shows BTC, Polymarket didn't
+# take it" report). With the guard OFF, every live asset places its full $1.5 order, no phantom
+# paper rows. TRADE-OFF: the all-4-same-side-loss bound is gone; worst case is now 4×$1.5 = $6/window
+# (still far under MAX_DAILY_LOSS=$50). To restore the cap WITHOUT shrinking size, re-enable and set
+# CERTAINTY_CORR_STAKE_USDC = 6.0 (= #live × base) so each share = min(1.5, 6/4=1.5) = full $1.5.
+CERTAINTY_CORR_GUARD_ENABLED = False
+CERTAINTY_CORR_STAKE_USDC    = 6.0    # max TOTAL same-side live certainty stake across assets / window (only used if guard re-enabled)
 
 # Confidence sizing (P3): in the validated late slice the edge is large and low-variance, so
 # size up there instead of flat $25. Stake = base, bumped to LATE_SIZE inside the late zone
