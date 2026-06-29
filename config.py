@@ -87,11 +87,30 @@ ASSET_PARAMS = {
             "coinbase_product": "XRP-USD", "chainlink_symbol": "xrp/usd",
             "chainlink_agg": "0x785ba89291f676b5386652eB12b30cF361020694",
             "slug_prefix": "xrp-updown-5m-", "title_pattern": "XRP Up or Down"},
+    # BNB (bnb-updown-5m-) — added 2026-06-29 as a RECORD-ONLY shadow asset. Resolves on the
+    # Chainlink BNB/USD data stream (verified RTDS `bnb/usd` streams live), so the strike comes
+    # from the RTDS feed; Binance has `bnbusdt`. NOTE: Coinbase does NOT list BNB, so the oracle
+    # has no Coinbase leg — it degrades gracefully to Binance (vol/blend) and the basis goes to 0.
+    # `chainlink_agg` is intentionally omitted: a WRONG on-chain aggregator would manufacture a
+    # phantom strike, so the on-chain fallback self-disables and we rely on RTDS + Binance.
+    # BNB is in CERTAINTY_ASSETS (the leg fires & records trades) but NOT CERTAINTY_LIVE_ASSETS
+    # (never real capital) and is listed in PNL_EXCLUDED_ASSETS (kept out of Session/Total P&L).
+    "BNB": {"name": "BNB",      "binance_symbol": "bnbusdt",
+            "coinbase_product": "BNB-USD", "chainlink_symbol": "bnb/usd",
+            "slug_prefix": "bnb-updown-5m-", "title_pattern": "BNB Up or Down"},
 }
 
-# Assets traded this session (env override: ASSETS=BTC,ETH,SOL,XRP).
-ASSETS = [a.strip().upper() for a in os.getenv("ASSETS", "BTC,ETH,SOL,XRP").split(",")
+# Assets traded this session (env override: ASSETS=BTC,ETH,SOL,XRP,BNB).
+ASSETS = [a.strip().upper() for a in os.getenv("ASSETS", "BTC,ETH,SOL,XRP,BNB").split(",")
           if a.strip().upper() in ASSET_PARAMS]
+
+# Record-only shadow assets: the certainty leg fires & logs their trades (visible on their own
+# dashboard tab), but their P&L is EXCLUDED from Session/Total P&L (see state._pnl_from_ledgers).
+# Use this for an asset you want to observe without it moving the headline P&L. BNB joined
+# 2026-06-29 this way — paper-only data gathering, never counted toward the bankroll.
+PNL_EXCLUDED_ASSETS = tuple(
+    a.strip().upper() for a in os.getenv("PNL_EXCLUDED_ASSETS", "BNB").split(",")
+    if a.strip().upper() in ASSET_PARAMS)
 
 # ─── Risk Limits ───────────────────────────────────────────────────────────────
 MAX_STAKE_PER_MARKET = 25.0    # USDC — max single position size (per asset-window)
@@ -296,7 +315,7 @@ CERTAINTY_SHADOW_ENABLED = True    # master switch (paper-only effect). False = 
 # can be re-added if it clears on London-tightened fills. NOTE: this gates only the certainty SHADOW;
 # `_record_tick` still records ticks for ALL config.ASSETS, so the BTC/ETH/XRP London A/B backtest is
 # fully preserved. See memory dashboard-pnl-survivorship-bias / certainty-asset-gate-sol-xrp.
-CERTAINTY_ASSETS = ("BTC", "ETH", "SOL", "XRP")   # leg fires on all 4 (paper & live) — all-asset go-live 2026-06-28
+CERTAINTY_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB")   # leg fires & records on all 5; BNB is record-only (PNL_EXCLUDED_ASSETS) — 2026-06-29
 # Live-capital whitelist: in --mode live, ONLY these assets place REAL orders; any other asset that
 # fires the leg falls through to a paper shadow even in live mode. 2026-06-28: WIDENED to all 4 at
 # the user's direction (was SOL-only). RISK NOTE: SOL is the only survivorship-free edge; XRP was the

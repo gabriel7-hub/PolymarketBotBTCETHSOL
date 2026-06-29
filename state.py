@@ -708,12 +708,20 @@ def _pnl_from_ledgers(conn, since: Optional[float] = None,
     [since, until) by closed_at. This is the SAME source the per-asset tabs use
     (get_asset_day_stats), so totals built from it always reconcile with the tabs. Rebates are
     pulled from daily_summary (the only place they live) and are ~0 on 5-min markets."""
+    # Record-only assets (config.PNL_EXCLUDED_ASSETS, e.g. BNB) still log every trade and show on
+    # their own dashboard tab, but are kept OUT of the headline Session/Total P&L computed here.
+    excl = ""
+    excl_params: list = []
+    if config.PNL_EXCLUDED_ASSETS:
+        excl = " AND asset NOT IN (%s)" % ",".join("?" * len(config.PNL_EXCLUDED_ASSETS))
+        excl_params = list(config.PNL_EXCLUDED_ASSETS)
     bounds = ""
-    params: list = []
+    bound_params: list = []
     if since is not None:
-        bounds += " AND closed_at >= ?"; params.append(since)
+        bounds += " AND closed_at >= ?"; bound_params.append(since)
     if until is not None:
-        bounds += " AND closed_at < ?";  params.append(until)
+        bounds += " AND closed_at < ?";  bound_params.append(until)
+    params = excl_params + bound_params
     agg = """
         SELECT COUNT(*)                            AS trades,
                COALESCE(SUM(pnl_usdc), 0)          AS net_pnl,
@@ -721,7 +729,7 @@ def _pnl_from_ledgers(conn, since: Optional[float] = None,
                COALESCE(SUM(outcome = 'LOSS'), 0)  AS losses,
                COALESCE(SUM(CASE WHEN pnl_usdc > 0 THEN pnl_usdc ELSE 0 END), 0) AS gross_profit,
                COALESCE(SUM(CASE WHEN pnl_usdc < 0 THEN -pnl_usdc ELSE 0 END), 0) AS gross_loss
-        FROM {tbl} WHERE status = 'RESOLVED'{leg}""" + bounds
+        FROM {tbl} WHERE status = 'RESOLVED'{leg}""" + excl + bounds
     pos = conn.execute(agg.format(tbl="positions", leg=""), params).fetchone()
     cert = conn.execute(agg.format(tbl="trades", leg=" AND leg = 'CERTAINTY'"), params).fetchone()
     if date is not None:
