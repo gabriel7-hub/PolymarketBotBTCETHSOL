@@ -397,7 +397,14 @@ CERTAINTY_DEAD_ASK_HI = 0.91
 # overturns the old "never trade the last 45s" doctrine for THIS leg: we are not racing a new
 # move, we are buying a favorite whose ask the book has left stale (lag persisting into our 1s
 # tick). Still measured top-of-book + 1 tick; the depth-walk is what the live paper run proves.
-CERTAINTY_ZONE_START = 220         # secs remaining: gate may start at/below this
+# NARROWED 220->120 (2026-06-30): the >120s "early" slice is near-zero-EV on the first full live
+# day (≥0.82 entries: −$0.10 over 229 trades, 88% win) AND it is the flip-prone, correlated-loss
+# zone — with 3+ min left a 5bp move easily reverses, and the 4 assets reverse together (observed
+# live: BTC UP@0.82 T-209s + XRP UP@0.85 T-203s both fired then the complex rolled over -16bp; the
+# only winner was ETH DOWN@0.96 at T-77s). Firing only ≤120s keeps the earner (mid 45-120s: 94.7%
+# win, +$5.74/day) and the late slice while cutting the early flip/correlation exposure. See
+# [[late-zone-certainty-edge]] / [[cross-asset-correlation-guard]].
+CERTAINTY_ZONE_START = 120         # secs remaining: gate may start at/below this
 CERTAINTY_ZONE_END   = 10          # secs remaining: gate stops at/below this (extended 45->10)
 
 # Window-Delta gate (the winners' DOMINANT signal): only fire when the oracle has ALREADY
