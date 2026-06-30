@@ -211,6 +211,26 @@ class PolymarketBook:
         book = self.up_book if side == "UP" else self.down_book
         return book.fill_ask(shares)
 
+    def ask_snapshot(self, side: str, tiers) -> dict:
+        """Fill-quality snapshot of one side's ask book: the best ask, the size resting at the
+        touch, and — for each USDC notional in `tiers` — the depth-walk VWAP and fill fraction
+        (filled / wanted). Used to measure how far slippage erodes the edge as size grows, so
+        sizing up past the base tranche is a measured move, not a guess. Read-only; never mutates."""
+        book = self.up_book if side == "UP" else self.down_book
+        best = book.best_ask
+        snap = {"best_ask": best,
+                "best_ask_size": book.asks.size_at(best) if best is not None else 0.0,
+                "tiers": {}}
+        if best is not None and best > 0:
+            for usd in tiers:
+                want = usd / best                       # shares targeted for this notional
+                filled, vwap = book.fill_ask(want)
+                snap["tiers"][usd] = {
+                    "vwap": round(vwap, 5) if filled > 0 else None,
+                    "frac": round(filled / want, 4) if want > 0 else 0.0,
+                }
+        return snap
+
     @property
     def up_spread(self) -> Optional[float]:
         return self.up_book.spread

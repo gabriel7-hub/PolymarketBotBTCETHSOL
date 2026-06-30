@@ -187,10 +187,30 @@ def init_db():
                 PRIMARY KEY (asset, start_ts)
             );
 
+            -- Fill-quality / depth snapshot, one row per certainty fire. Answers "how big can we
+            -- fill before slippage eats the edge" — depth_json holds {usd_tier: {vwap, frac}}.
+            CREATE TABLE IF NOT EXISTS cert_fills (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts            REAL NOT NULL,
+                asset         TEXT NOT NULL DEFAULT 'BTC',
+                start_ts      INTEGER,
+                side          TEXT,
+                t_remaining   REAL,
+                p_side        REAL,
+                ask_at_signal REAL,        -- top-of-book ask the gate decided on
+                best_ask      REAL,        -- best ask at snapshot time
+                best_ask_size REAL,        -- shares resting at the touch
+                fill_price    REAL,        -- realized entry (paper VWAP+tick / live); slip = fill - ask_at_signal
+                size_usdc     REAL,        -- notional actually taken this fire
+                depth_json    TEXT,        -- {usd_tier: {vwap, frac}} depth-walk ladder
+                trade_id      INTEGER      -- linked trades.id (paper) if a shadow row was opened
+            );
+
             CREATE INDEX IF NOT EXISTS idx_signals_ts      ON signals(ts);
             CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
             CREATE INDEX IF NOT EXISTS idx_ticks_start     ON ticks(start_ts);
             CREATE INDEX IF NOT EXISTS idx_trades_ts       ON trades(ts);
+            CREATE INDEX IF NOT EXISTS idx_cert_fills      ON cert_fills(asset, start_ts);
         """)
         _migrate_multi_asset(conn)
     logger.info(f"Database initialised at {config.DB_PATH} (assets: {', '.join(config.ASSETS)})")
@@ -305,6 +325,28 @@ def record_trade(data: dict) -> int:
             "detail": data.get("detail"), "size_usdc": data.get("size_usdc"),
             "pnl_usdc": data.get("pnl_usdc", 0.0), "status": data.get("status"),
             "outcome": data.get("outcome"), "closed_at": data.get("closed_at"),
+        })
+        return cur.lastrowid
+
+
+def record_cert_fill(data: dict) -> int:
+    """Append a fill-quality / depth snapshot for one certainty fire. Returns the row id."""
+    with _conn() as conn:
+        cur = conn.execute("""
+            INSERT INTO cert_fills
+              (ts, asset, start_ts, side, t_remaining, p_side, ask_at_signal, best_ask,
+               best_ask_size, fill_price, size_usdc, depth_json, trade_id)
+            VALUES
+              (:ts, :asset, :start_ts, :side, :t_remaining, :p_side, :ask_at_signal, :best_ask,
+               :best_ask_size, :fill_price, :size_usdc, :depth_json, :trade_id)
+        """, {
+            "ts": data.get("ts", time.time()),
+            "asset": data.get("asset", "BTC"), "start_ts": data.get("start_ts"),
+            "side": data.get("side"), "t_remaining": data.get("t_remaining"),
+            "p_side": data.get("p_side"), "ask_at_signal": data.get("ask_at_signal"),
+            "best_ask": data.get("best_ask"), "best_ask_size": data.get("best_ask_size"),
+            "fill_price": data.get("fill_price"), "size_usdc": data.get("size_usdc"),
+            "depth_json": data.get("depth_json"), "trade_id": data.get("trade_id"),
         })
         return cur.lastrowid
 

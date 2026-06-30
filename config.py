@@ -326,10 +326,19 @@ CERTAINTY_LIVE_ASSETS = ("BTC", "ETH", "SOL", "XRP")
 CERTAINTY_FLOOR      = 0.80        # min model prob for the side to count as "certain"
 CERTAINTY_LAG_MARGIN = 0.03        # min book lag (p_side − ask) required to enter
 CERTAINTY_MAX_ASK    = 0.97        # never buy above this — taker fee eats the edge past here
-CERTAINTY_MIN_ASK    = 0.78        # never buy BELOW this. Lowered 0.82→0.78 (2026-06-28) — see note.
+CERTAINTY_MIN_ASK    = 0.82        # never buy BELOW this. RAISED back 0.78→0.82 (2026-06-30) — see note.
 CERTAINTY_SIZE_USDC  = 1.5         # base notional per certainty bet ($1.5 live tranche 2026-06-27)
 CERTAINTY_MIN_ORDER_USDC = 1.0     # Polymarket minimum order ($1); never place a live order below this
 #                                    (a guard-reduced share under $1 falls through to a paper shadow)
+
+# ─── Fill-quality / depth telemetry (2026-06-30) ──────────────────────────────────────────
+# At each certainty fire, snapshot the ask-book DEPTH the trade actually saw: the size at the
+# touch and the depth-walk VWAP + fill-fraction for several USDC notional tiers. We currently log
+# top-of-book PRICES everywhere but never QUANTITIES, so we cannot answer "how big can we fill
+# before slippage eats the ~1.3%/trade edge" — the gating question for sizing up past $1.5. One
+# row per fire (~550/day, negligible) in the `cert_fills` table; replay edge-vs-size offline.
+CERT_DEPTH_LOG_ENABLED = True
+CERT_DEPTH_TIERS = (1.5, 5.0, 15.0, 25.0, 50.0)   # USDC notionals to price the depth-walk at
 # CERTAINTY_MIN_ASK: only enter when the BOOK already prices the favorite ≥ this. A large
 # model-vs-book gap (model 0.90 while the book sits near 0.50) is NOT feed-lag — it is model
 # overconfidence against a fairly-priced book, and those entries LOSE under realistic fills.
@@ -343,9 +352,22 @@ CERTAINTY_MIN_ORDER_USDC = 1.0     # Polymarket minimum order ($1); never place 
 #   0.78-0.80 : 86.8% win,  net edge +7.0      → +$74
 #   0.80-0.82 : 87.2% win,  net edge +5.3      → +$25
 # Realized win% AT a given book ask is a market property (book underprices favorites here, 87% vs
-# ~79% breakeven), so it is more model-independent / robust than the rejected barbell. Hence floor
-# lowered to 0.78. CAVEAT: the 0.78-0.82 sample is modest (77 trades, mostly pre-recal; n=22 post-recal
-# @ 90.9%/+$21) — monitor with `analyze_barbell.py --leg CERT_LIVE` and raise back if it regresses.
+# ~79% breakeven), so it is more model-independent / robust than the rejected barbell. The floor was
+# lowered to 0.78 with the CAVEAT to "raise back if it regresses" on a larger sample.
+# REGRESSED — RAISED BACK TO 0.82 (2026-06-30): the first FULL live day (bot_state.db, 541 real
+# certainty fills, 4 assets @ $1.5) invalidated the 0.78 band. Entry-bucket P&L for 2026-06-30:
+#   <0.78    : 72.4% win  -$2.48   (leaked past the 0.78 gate via signal→fill ask drift)
+#   0.78-0.80: 76.2% win  -$6.56   ← biggest single bleeder
+#   0.80-0.82: 78.6% win  -$3.95
+#   0.82-0.86: 88.5% win  +$7.92
+#   0.86-0.90: 87.6% win  -$0.92
+#   >=0.90   : 93.2% win  -$0.50
+# Sub-0.82 summed to -$12.99 ≈ the ENTIRE day's -$12.93 loss; entries >=0.82 netted +$6.51.
+# Per asset, restoring the 0.82 floor flips today: SOL -10.47→+2.06, total -6.48→+6.51 (ETH/XRP
+# stay positive; BTC stays slightly negative -4.06 even at 0.82 — it is the persistently weak asset).
+# The 0.78-0.82 band wins only ~76-79% live vs the ~80-82% breakeven there — exactly the model-
+# overconfidence-vs-fair-book bleed the floor exists to exclude. Monitor with `analyze_barbell.py
+# --leg CERT_LIVE`; do not lower again without a large bias-free sample that reproduces the edge.
 # Do NOT go below 0.78: sub-0.78 is the validated bleed zone. (A model-vs-book gap CAP was separately
 # tried and REJECTED, PF→0.85.) Bonus: cheaper entries also shrink the "1 loss eats N wins" ratio.
 # REJECTED by the same validation: a model-vs-book gap CAP (hurt, PF→0.85) and firing only in

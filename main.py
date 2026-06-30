@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import json
 import time
 import threading
 from typing import Optional
@@ -438,6 +439,12 @@ class AssetWorker:
                                 self._cert_shadow[start_ts] = {"live": True, "side": cside}
                                 if start_ts not in self._resolved:
                                     self._pending[start_ts] = window.condition_id
+                                self._record_cert_fill(
+                                    start_ts=start_ts, side=cside, cask=cask,
+                                    t_remaining=signal.time_remaining,
+                                    p_side=(signal.p_up if cside == "UP"
+                                            else 1.0 - signal.p_up),
+                                    fill_price=cask, size_usdc=csize, trade_id=None)
                     elif pick is not None:
                         cside, cask, csize = pick
                         if config.CERTAINTY_MAKER_ENABLED:
@@ -714,6 +721,25 @@ class AssetWorker:
                     f"{'WIN' if won else 'LOSS'} pnl={pnl:+.2f} "
                     f"(session {self._late_mom_session:+.2f})")
 
+    def _record_cert_fill(self, *, start_ts, side, cask, t_remaining, p_side,
+                          fill_price, size_usdc, trade_id=None):
+        """Snapshot the ask-book depth this certainty fire saw (size at the touch + depth-walk
+        VWAP/fill-fraction per USDC tier) so edge-vs-size is measurable offline. Best-effort:
+        any failure here must never disturb the trade path."""
+        if not config.CERT_DEPTH_LOG_ENABLED or self.book is None:
+            return
+        try:
+            snap = self.book.ask_snapshot(side, config.CERT_DEPTH_TIERS)
+            state.record_cert_fill({
+                "asset": self.asset, "start_ts": start_ts, "side": side,
+                "t_remaining": t_remaining, "p_side": p_side, "ask_at_signal": cask,
+                "best_ask": snap.get("best_ask"), "best_ask_size": snap.get("best_ask_size"),
+                "fill_price": fill_price, "size_usdc": size_usdc,
+                "depth_json": json.dumps(snap.get("tiers", {})), "trade_id": trade_id,
+            })
+        except Exception as e:
+            logger.warning(f"[{self.asset}] cert_fill depth snapshot failed: {e}")
+
     def _open_cert_paper(self, window, start_ts, side, cask, entry, shares,
                          *, maker: bool, label: str, t_fired: float, p_up: float = 0.0):
         """Record an open paper CERTAINTY shadow row + register it for resolution. Shared by the
@@ -744,6 +770,10 @@ class AssetWorker:
         self._cert_slip_n += 1
         logger.info(f"[PAPER·SHADOW][{self.asset}] certainty {side}{tag} ask={cask:.2f} "
                     f"fill={entry:.3f} slip={slip_c:+.1f}c sh={shares:.1f}")
+        self._record_cert_fill(
+            start_ts=start_ts, side=side, cask=cask, t_remaining=t_fired,
+            p_side=(p_up if side == "UP" else 1.0 - p_up), fill_price=entry,
+            size_usdc=round(shares * entry, 2), trade_id=tid)
 
     def _check_maker_fills(self, signal, window, start_ts: int):
         """Settle a resting maker-first cert limit against the live book each tick. It fills as a
