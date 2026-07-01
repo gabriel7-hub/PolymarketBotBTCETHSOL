@@ -1340,8 +1340,15 @@ class BotRunner:
             # the mode label. Per-asset cooldowns show in each asset's risk_status.
             any_halt = any(w.risk.is_halted for w in self.workers.values())
             live_stopped = self.live_halt.is_set()
+            # "Armed" = the process can actually place REAL capital. Even in --mode live, NO leg
+            # deploys capital unless config.CERTAINTY_LIVE_ENABLED is on (the directional taker is
+            # disabled). So a live process with the master switch OFF is functionally PAPER — show
+            # that plainly (status LIVE·OFF, amber) instead of a green LIVE that implies real risk.
+            live_armed = (not self.paper_mode) and config.CERTAINTY_LIVE_ENABLED
             if self.paper_mode:
                 status = "PAPER"
+            elif not live_armed:
+                status = "LIVE·OFF"     # live process, capital disarmed (CERTAINTY_LIVE_ENABLED=False)
             elif live_stopped:
                 status = "STOPPED"
             elif any_halt:
@@ -1353,6 +1360,7 @@ class BotRunner:
                 "bot": {
                     "mode": "PAPER" if self.paper_mode else "LIVE",
                     "status": status,
+                    "live_armed": live_armed,
                     "live_halt": live_stopped,
                     "assets": list(self.workers.keys()),
                     "daily_pnl": round(daily.get("net_pnl", 0.0), 2),

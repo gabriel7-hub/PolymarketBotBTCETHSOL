@@ -429,7 +429,12 @@ function render(d){
 
   // header
   const stat=(bot.status||'PAPER'),sl=stat.toLowerCase();
-  set('h-mode',stat,'pill '+(sl.includes('halt')?'halted':sl.includes('cool')?'cooldown':sl==='live'?'live':'paper'));
+  // LIVE·OFF = process is --mode live but no leg can deploy capital (CERTAINTY_LIVE_ENABLED=False):
+  // functionally paper, so show an amber (cooldown) pill, never the green 'live' one.
+  const pillc = sl.includes('halt')?'halted':sl.includes('stop')?'stopped'
+              : sl.includes('off')?'cooldown':sl.includes('cool')?'cooldown'
+              : sl==='live'?'live':'paper';
+  set('h-mode',stat,'pill '+pillc);
   set('h-pnl',money(bot.daily_pnl),'v num '+pnlc(bot.daily_pnl));
   set('h-opnl',money(bot.overall_pnl),'v num '+pnlc(bot.overall_pnl));
   set('h-rebate',bot.rebates_today!=null?'+$'+f(bot.rebates_today,3):'—','v num up');
@@ -437,7 +442,7 @@ function render(d){
   set('h-wr',bot.win_rate!=null?pct(bot.win_rate):'—','v num '+(bot.win_rate>=.5?'up':bot.win_rate!=null?'down':'muted'));
   // LIVE kill switch — only shown in LIVE mode; reflects the bot's live_halt flag.
   const kb=$('kill-btn');
-  if(kb){ if(bot.mode==='LIVE'){applyKill(!!bot.live_halt)} else {kb.className='killbtn hidden'} }
+  if(kb){ if(bot.mode==='LIVE'&&bot.live_armed){applyKill(!!bot.live_halt)} else {kb.className='killbtn hidden'} }
   led('led-oracle',!!btc.connected); led('led-book',!!bk.connected);
 
   // oracle price block
@@ -461,8 +466,10 @@ function render(d){
   (function(){
     const re=strk.ref_error||{}, sc=strk.source_counts||{};
     const age=strk.rtds_last_tick_age;
-    const rtds = strk.rtds_connected ? ('RTDS '+(age!=null?age.toFixed(0)+'s':'live')
-                 + (age!=null&&age>8?' ⚠stale':'')) : 'RTDS ✗';
+    const rtds = strk.rtds_connected
+                 ? (age!=null ? ('RTDS '+age.toFixed(0)+'s'+(age>8?' ⚠stale':''))
+                              : 'RTDS …(no tick)')
+                 : 'RTDS ✗';
     const err = re.n ? ('err med '+f(re.median_abs_bp||0,1)+'/max '+f(re.max_abs_bp||0,1)+'bp'
                  + (re.side_mismatches?(' · '+re.side_mismatches+' side-miss'):'')+' (n'+re.n+')')
                  : 'err —';
