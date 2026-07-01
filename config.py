@@ -338,10 +338,12 @@ CERTAINTY_LIVE_ASSETS = ("BTC", "ETH", "SOL")
 # model confidently wrong. Paper shadows still record on every source for the audit.
 CERTAINTY_REQUIRE_RTDS_LIVE = True
 CERTAINTY_FLOOR      = 0.80        # min model prob for the side to count as "certain"
-CERTAINTY_LAG_MARGIN = 0.08        # min book lag (p_side − ask) required to enter. TIGHTENED 0.03→0.08
-                                   # (2026-07-01, IMPROVEMENT.md §3): late_lag8 scored PF ~3.02 in the
-                                   # post-9PM-IST sample vs PF 1.99 at the looser 3c lag — 3c admits
-                                   # too many weak states.
+# LOOSENED 0.08->0.05 (2026-07-01, TEST MODE): the 45-10s + 20bp + 0.08-lag combo went to ZERO paper
+# fires for 50+ minutes straight (ledger stalled at 22:04 IST) — too strict to generate any P&L
+# signal to validate. Capital is already OFF (CERTAINTY_LIVE_ENABLED=False), so this only affects
+# paper data collection speed, not risk. Tighten back toward 0.08 once enough fresh fills exist to
+# judge PF. See IMPROVEMENT.md §3 for the original reasoning.
+CERTAINTY_LAG_MARGIN = 0.05
 CERTAINTY_MAX_ASK    = 0.94        # never buy above this UNLESS the high-ask exception fires (below).
                                    # LOWERED 0.97→0.94 (2026-07-01, IMPROVEMENT.md §4): ask≥.95 entries
                                    # were NET NEGATIVE overall because they were often taken too early
@@ -436,22 +438,37 @@ CERTAINTY_DEAD_ASK_HI = 0.91
 # candidate must be the late-only slice, so the gate no longer fires before T-45s. Keep the wider
 # 10-220s zone ONLY as an offline research diagnostic (backtest.py --certainty), not as the live
 # candidate. See [[late-zone-certainty-edge]].
-CERTAINTY_ZONE_START = 45          # secs remaining: gate may start at/below this (late-only)
+# WIDENED 45->120 (2026-07-01, TEST MODE): with the 20bp move gate the 45-10s slice alone produced
+# ZERO fires for 50+ minutes (BTC/ETH/SOL distance_bp were sitting at 3-15bp — under the bar — for
+# the entire drought). Reopening the validated 45-120s mid slice (94.7% win, +$5.74/day per the
+# 2026-06-30 note above) restores trade flow so the paper ledger can actually accumulate a P&L
+# sample. CERTAINTY_LIVE_ENABLED stays False, so this is paper-only exposure. Narrow back to 45
+# once there's enough fresh data to re-judge the late-only-vs-blended PF split.
+CERTAINTY_ZONE_START = 120         # secs remaining: gate may start at/below this
 CERTAINTY_ZONE_END   = 10          # secs remaining: gate stops at/below this
 
 # Window-Delta gate (the winners' DOMINANT signal): only fire when the oracle has ALREADY
 # moved >= this many bp from the strike. RAISED 5.0->20.0 (2026-07-01, IMPROVEMENT.md §P0): our
 # recorded ref_price can differ from Polymarket's official priceToBeat by 10-20bp (BTC ~15bp, SOL
 # ~21bp), so a 5bp move gate is NOT safe — the strike itself can be wrong by more than the move.
-# Do NOT lower back to 5.0 until the stored official ref_error_bp distribution (P0 audit) proves the
-# live strike estimate is reliably inside the move gate.
-CERTAINTY_MIN_MOVE_BP = 20.0
+# LOOSENED 20.0->8.0 (2026-07-01, TEST MODE): 20bp combined with the narrow zone produced a total
+# trading stall (0 fires / 50+ min, confirmed via live dashboard websocket). Paper capital is not at
+# risk (CERTAINTY_LIVE_ENABLED=False) and the official ref_error_bp audit (P0) is now recording on
+# every resolved window regardless of this threshold, so we can loosen here to get a P&L sample
+# WITHOUT losing the audit data. Raise back toward 20.0 once ref_error_bp proves the strike is
+# reliably tighter than that, or lower toward 5.0 if it proves tighter still.
+CERTAINTY_MIN_MOVE_BP = 8.0
 # Strike-source-aware move gate: the confidence in our strike depends on where it came from, so the
 # minimum move scales with source uncertainty. 'rtds' is the exact Price-to-Beat; 'onchain' (~0.5bp)
 # and 'proxy' (~4-5bp basis) are looser, so demand a bigger observed move before trusting the signal.
 # certainty_shadow() applies max(this[source], CERTAINTY_MIN_MOVE_BP). After the P0 audit proves
 # rtds ref_error is small, the 'rtds' entry can be lowered toward 5.0.
-CERTAINTY_MIN_MOVE_BP_BY_SOURCE = {"rtds": 20.0, "onchain": 20.0, "proxy": 25.0}
+# LOOSENED (2026-07-01, TEST MODE): these were 20/20/25, which — via max() against the base
+# CERTAINTY_MIN_MOVE_BP above — silently overrode any lowering of the base value. Dropped in step
+# with it so the test config actually takes effect. onchain/proxy still carry a premium over rtds
+# since they're less trustworthy strike sources; rtds is currently never observed live (feed issue,
+# see strike-truth telemetry) so onchain is the effective floor today.
+CERTAINTY_MIN_MOVE_BP_BY_SOURCE = {"rtds": 8.0, "onchain": 10.0, "proxy": 15.0}
 
 # ─── Cross-asset CORRELATION guard (2026-06-28) ───────────────────────────────────────────
 # The 4 assets move together, so N simultaneous same-direction certainty bets in one 5-min window
