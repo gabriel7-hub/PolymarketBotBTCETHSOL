@@ -160,6 +160,13 @@ class ChainlinkFeed:
         """True only if a real price arrived recently (the feed is sparse)."""
         return self.current_price > 0 and (time.time() - self._last_ts) <= config.CHAINLINK_MAX_STALE
 
+    @property
+    def last_tick_age(self) -> Optional[float]:
+        """Seconds since the last real RTDS price tick, or None if none seen yet. Feeds the P0
+        dashboard staleness indicator — a large age means Chainlink is stale and the strike may
+        be falling back to on-chain / CEX proxy."""
+        return (time.time() - self._last_ts) if self._last_ts > 0 else None
+
     def stop(self):
         self._stop.set()
         if self._ws:
@@ -378,6 +385,21 @@ class Oracle:
         if self._chainlink_onchain.fresh:
             return "onchain"
         return "proxy"
+
+    @property
+    def rtds_connected(self) -> bool:
+        """RTDS (exact Chainlink Data-Streams) socket connectivity — for the P0 dashboard panel."""
+        return bool(self._chainlink.connected)
+
+    @property
+    def rtds_last_tick_age(self) -> Optional[float]:
+        """Seconds since the last RTDS Chainlink price tick (None if none yet)."""
+        return self._chainlink.last_tick_age
+
+    @property
+    def onchain_fresh(self) -> bool:
+        """Whether the on-chain Chainlink fallback currently has a fresh reading."""
+        return bool(self._chainlink_onchain.fresh)
 
     @property
     def _cex_blend(self) -> float:

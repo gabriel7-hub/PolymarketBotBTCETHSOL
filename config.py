@@ -101,7 +101,11 @@ ASSET_PARAMS = {
 }
 
 # Assets traded this session (env override: ASSETS=BTC,ETH,SOL,XRP,BNB).
-ASSETS = [a.strip().upper() for a in os.getenv("ASSETS", "BTC,ETH,SOL,XRP,BNB").split(",")
+# NARROWED to BTC/ETH/SOL (2026-07-01, IMPROVEMENT.md §2): XRP was NEGATIVE in the post-9PM-IST
+# sample (112 trades, -$3.94, PF 0.83) and BNB is a record-only shadow that hasn't been separately
+# validated on the 5-min thesis — both are OUT of the core universe until they clear on their own.
+# Re-add via env (ASSETS=BTC,ETH,SOL,XRP,BNB) once validated. XRP/BNB stay in ASSET_PARAMS.
+ASSETS = [a.strip().upper() for a in os.getenv("ASSETS", "BTC,ETH,SOL").split(",")
           if a.strip().upper() in ASSET_PARAMS]
 
 # Record-only shadow assets: the certainty leg fires & logs their trades (visible on their own
@@ -315,17 +319,39 @@ CERTAINTY_SHADOW_ENABLED = True    # master switch (paper-only effect). False = 
 # can be re-added if it clears on London-tightened fills. NOTE: this gates only the certainty SHADOW;
 # `_record_tick` still records ticks for ALL config.ASSETS, so the BTC/ETH/XRP London A/B backtest is
 # fully preserved. See memory dashboard-pnl-survivorship-bias / certainty-asset-gate-sol-xrp.
-CERTAINTY_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB")   # leg fires & records on all 5; BNB is record-only (PNL_EXCLUDED_ASSETS) — 2026-06-29
-# Live-capital whitelist: in --mode live, ONLY these assets place REAL orders; any other asset that
-# fires the leg falls through to a paper shadow even in live mode. 2026-06-28: WIDENED to all 4 at
-# the user's direction (was SOL-only). RISK NOTE: SOL is the only survivorship-free edge; XRP was the
-# only NEGATIVE-edge asset on fresh on-chain data and BTC/ETH are marginal — the cross-asset stake
-# guard below (bounds an all-4 same-side loss to CERTAINTY_CORR_STAKE_USDC) is the safety belt that
-# makes this defensible. Watch XRP's live P&L closely. See certainty-asset-gate-sol-xrp / golive-sol-only.
-CERTAINTY_LIVE_ASSETS = ("BTC", "ETH", "SOL", "XRP")
+CERTAINTY_ASSETS = ("BTC", "ETH", "SOL")   # leg fires & records on these; XRP/BNB dropped 2026-07-01 (IMPROVEMENT.md §2)
+# ─── LIVE-capital master switch (2026-07-01, IMPROVEMENT.md §Recommended Candidate Config) ──────
+# The blended system is only PF ~1.12 and the strike-truth audit (P0) has NOT yet proven our
+# recorded Price-to-Beat is reliably within the move gate. So NO real capital until the late-only
+# candidate clears its gate on official settlement numbers. When False the certainty leg is
+# PAPER-ONLY on every asset (the live order branch in main.py is skipped) regardless of
+# CERTAINTY_LIVE_ASSETS. Flip True only after the Paper→Live checklist (late-only PF ≥ 1.5 on
+# depth-realistic fills, official ref_error_bp proven small) is cleared.
+CERTAINTY_LIVE_ENABLED = False
+# Live-capital whitelist: in --mode live AND with CERTAINTY_LIVE_ENABLED=True, ONLY these assets
+# place REAL orders; any other asset that fires the leg falls through to a paper shadow. XRP dropped
+# 2026-07-01 (negative edge in the post-9PM-IST sample). See certainty-asset-gate-sol-xrp.
+CERTAINTY_LIVE_ASSETS = ("BTC", "ETH", "SOL")
+# Strike-truth safety gate (P0): with the strike audit not yet clean, only place REAL certainty
+# capital when the strike was snapshotted from the EXACT Chainlink Data-Streams feed ('rtds'). An
+# 'onchain' (~0.5bp) or 'proxy' (~4-5bp) strike can be wrong by more than the move gate, making the
+# model confidently wrong. Paper shadows still record on every source for the audit.
+CERTAINTY_REQUIRE_RTDS_LIVE = True
 CERTAINTY_FLOOR      = 0.80        # min model prob for the side to count as "certain"
-CERTAINTY_LAG_MARGIN = 0.03        # min book lag (p_side − ask) required to enter
-CERTAINTY_MAX_ASK    = 0.97        # never buy above this — taker fee eats the edge past here
+CERTAINTY_LAG_MARGIN = 0.08        # min book lag (p_side − ask) required to enter. TIGHTENED 0.03→0.08
+                                   # (2026-07-01, IMPROVEMENT.md §3): late_lag8 scored PF ~3.02 in the
+                                   # post-9PM-IST sample vs PF 1.99 at the looser 3c lag — 3c admits
+                                   # too many weak states.
+CERTAINTY_MAX_ASK    = 0.94        # never buy above this UNLESS the high-ask exception fires (below).
+                                   # LOWERED 0.97→0.94 (2026-07-01, IMPROVEMENT.md §4): ask≥.95 entries
+                                   # were NET NEGATIVE overall because they were often taken too early
+                                   # (T-90s), where a near-locked favorite can still flip.
+# High-ask exception: allow a rich ask ABOVE CERTAINTY_MAX_ASK only when the trade is extremely late
+# and near-locked (the winners' genuine .95-.99 late-favorite fills). See signal_engine.allow_certainty_entry.
+CERTAINTY_HIGH_ASK_MAX      = 0.97   # absolute ceiling even for the exception
+CERTAINTY_HIGH_ASK_MAX_T    = 20     # only inside the last this-many secs
+CERTAINTY_HIGH_ASK_MIN_P    = 0.99   # model must be near-certain
+CERTAINTY_HIGH_ASK_MIN_EDGE = 0.04   # and still carry ≥ this book lag (p_side − ask)
 CERTAINTY_MIN_ASK    = 0.82        # never buy BELOW this. RAISED back 0.78→0.82 (2026-06-30) — see note.
 CERTAINTY_SIZE_USDC  = 1.5         # base notional per certainty bet ($1.5 live tranche 2026-06-27)
 CERTAINTY_MIN_ORDER_USDC = 1.0     # Polymarket minimum order ($1); never place a live order below this
@@ -404,13 +430,28 @@ CERTAINTY_DEAD_ASK_HI = 0.91
 # only winner was ETH DOWN@0.96 at T-77s). Firing only ≤120s keeps the earner (mid 45-120s: 94.7%
 # win, +$5.74/day) and the late slice while cutting the early flip/correlation exposure. See
 # [[late-zone-certainty-edge]] / [[cross-asset-correlation-guard]].
-CERTAINTY_ZONE_START = 120         # secs remaining: gate may start at/below this
-CERTAINTY_ZONE_END   = 10          # secs remaining: gate stops at/below this (extended 45->10)
+# NARROWED 120->45 (2026-07-01, IMPROVEMENT.md §1/§Main-Leak): the post-9PM-IST DB showed most of
+# our fills landed at T-90s..T-105s (the WEAK mid-window regime) — 476 early fills earned +$5.15 (PF
+# ~1.07) while just 48 LATE (10-45s) fills earned nearly as much, +$4.50 at PF 1.99. The capital
+# candidate must be the late-only slice, so the gate no longer fires before T-45s. Keep the wider
+# 10-220s zone ONLY as an offline research diagnostic (backtest.py --certainty), not as the live
+# candidate. See [[late-zone-certainty-edge]].
+CERTAINTY_ZONE_START = 45          # secs remaining: gate may start at/below this (late-only)
+CERTAINTY_ZONE_END   = 10          # secs remaining: gate stops at/below this
 
 # Window-Delta gate (the winners' DOMINANT signal): only fire when the oracle has ALREADY
-# moved >= this many bp from the strike. Raises win%/PF (late slice 1.59 -> 1.91 at 5bp ->
-# 2.57 at 10bp) by skipping the near-boundary windows where the favorite can still flip.
-CERTAINTY_MIN_MOVE_BP = 5.0
+# moved >= this many bp from the strike. RAISED 5.0->20.0 (2026-07-01, IMPROVEMENT.md §P0): our
+# recorded ref_price can differ from Polymarket's official priceToBeat by 10-20bp (BTC ~15bp, SOL
+# ~21bp), so a 5bp move gate is NOT safe — the strike itself can be wrong by more than the move.
+# Do NOT lower back to 5.0 until the stored official ref_error_bp distribution (P0 audit) proves the
+# live strike estimate is reliably inside the move gate.
+CERTAINTY_MIN_MOVE_BP = 20.0
+# Strike-source-aware move gate: the confidence in our strike depends on where it came from, so the
+# minimum move scales with source uncertainty. 'rtds' is the exact Price-to-Beat; 'onchain' (~0.5bp)
+# and 'proxy' (~4-5bp basis) are looser, so demand a bigger observed move before trusting the signal.
+# certainty_shadow() applies max(this[source], CERTAINTY_MIN_MOVE_BP). After the P0 audit proves
+# rtds ref_error is small, the 'rtds' entry can be lowered toward 5.0.
+CERTAINTY_MIN_MOVE_BP_BY_SOURCE = {"rtds": 20.0, "onchain": 20.0, "proxy": 25.0}
 
 # ─── Cross-asset CORRELATION guard (2026-06-28) ───────────────────────────────────────────
 # The 4 assets move together, so N simultaneous same-direction certainty bets in one 5-min window

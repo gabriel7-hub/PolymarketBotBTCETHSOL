@@ -184,6 +184,13 @@ def init_db():
                 resolved_at     REAL,
                 resolution_source TEXT,         -- 'REAL' (Polymarket) | 'FALLBACK' (our oracle).
                                                 -- Calibrate (backtest.py) on REAL only.
+                -- P0 strike-truth audit (IMPROVEMENT.md): official Polymarket settlement numbers
+                -- from Gamma eventMetadata, plus how far OUR snapshotted strike/settle missed them.
+                official_price_to_beat REAL,    -- Gamma eventMetadata.priceToBeat (true strike)
+                official_final_price   REAL,    -- Gamma eventMetadata.finalPrice (true settle)
+                official_winning_side  TEXT,    -- 'UP'/'DOWN' derived from official prices
+                ref_error_bp    REAL,           -- (our ref_price − official_price_to_beat)/official ·1e4
+                final_error_bp  REAL,           -- (our settle_price − official_final_price)/official ·1e4
                 PRIMARY KEY (asset, start_ts)
             );
 
@@ -234,6 +241,14 @@ def _migrate_multi_asset(conn: sqlite3.Connection):
     if out_cols and "resolution_source" not in out_cols:
         conn.execute("ALTER TABLE outcomes ADD COLUMN resolution_source TEXT")
         out_cols.append("resolution_source")
+    # P0 strike-truth audit fields (IMPROVEMENT.md) — additive, idempotent.
+    for col, decl in (("official_price_to_beat", "REAL"), ("official_final_price", "REAL"),
+                      ("official_winning_side", "TEXT"), ("ref_error_bp", "REAL"),
+                      ("final_error_bp", "REAL")):
+        if out_cols and col not in out_cols:
+            conn.execute(f"ALTER TABLE outcomes ADD COLUMN {col} {decl}")
+            out_cols.append(col)
+            logger.info(f"Migration: added {col} column to outcomes")
     if out_cols and "asset" not in out_cols:
         conn.executescript("""
             ALTER TABLE outcomes RENAME TO outcomes_v1;
@@ -247,13 +262,22 @@ def _migrate_multi_asset(conn: sqlite3.Connection):
                 predicted_side  TEXT,
                 resolved_at     REAL,
                 resolution_source TEXT,
+                official_price_to_beat REAL,
+                official_final_price   REAL,
+                official_winning_side  TEXT,
+                ref_error_bp    REAL,
+                final_error_bp  REAL,
                 PRIMARY KEY (asset, start_ts)
             );
             INSERT INTO outcomes
                 (asset, start_ts, market_id, ref_price, settle_price,
-                 winning_side, predicted_side, resolved_at, resolution_source)
+                 winning_side, predicted_side, resolved_at, resolution_source,
+                 official_price_to_beat, official_final_price, official_winning_side,
+                 ref_error_bp, final_error_bp)
             SELECT 'BTC', start_ts, market_id, ref_price, settle_price,
-                   winning_side, predicted_side, resolved_at, resolution_source
+                   winning_side, predicted_side, resolved_at, resolution_source,
+                   official_price_to_beat, official_final_price, official_winning_side,
+                   ref_error_bp, final_error_bp
             FROM outcomes_v1;
             DROP TABLE outcomes_v1;
         """)
@@ -280,21 +304,59 @@ def insert_tick(data: dict):
 def upsert_outcome(data: dict):
     data.setdefault("resolution_source", None)
     data.setdefault("asset", "BTC")
+    for k in ("official_price_to_beat", "official_final_price", "official_winning_side",
+              "ref_error_bp", "final_error_bp"):
+        data.setdefault(k, None)
     with _conn() as conn:
         conn.execute("""
             INSERT INTO outcomes
               (asset, start_ts, market_id, ref_price, settle_price, winning_side,
-               predicted_side, resolved_at, resolution_source)
+               predicted_side, resolved_at, resolution_source,
+               official_price_to_beat, official_final_price, official_winning_side,
+               ref_error_bp, final_error_bp)
             VALUES
               (:asset, :start_ts, :market_id, :ref_price, :settle_price, :winning_side,
-               :predicted_side, :resolved_at, :resolution_source)
+               :predicted_side, :resolved_at, :resolution_source,
+               :official_price_to_beat, :official_final_price, :official_winning_side,
+               :ref_error_bp, :final_error_bp)
             ON CONFLICT(asset, start_ts) DO UPDATE SET
                 winning_side      = excluded.winning_side,
                 settle_price      = excluded.settle_price,
                 predicted_side    = excluded.predicted_side,
                 resolved_at       = excluded.resolved_at,
-                resolution_source = excluded.resolution_source
+                resolution_source = excluded.resolution_source,
+                -- Only overwrite official audit fields when the new row actually carries them
+                -- (a later REAL-outcome poll may arrive without metadata; don't null them out).
+                official_price_to_beat = COALESCE(excluded.official_price_to_beat, outcomes.official_price_to_beat),
+                official_final_price   = COALESCE(excluded.official_final_price,   outcomes.official_final_price),
+                official_winning_side  = COALESCE(excluded.official_winning_side,  outcomes.official_winning_side),
+                ref_error_bp    = COALESCE(excluded.ref_error_bp,   outcomes.ref_error_bp),
+                final_error_bp  = COALESCE(excluded.final_error_bp, outcomes.final_error_bp)
         """, data)
+
+
+def get_ref_error_stats(asset: str = "BTC", limit: int = 200) -> dict:
+    """Rolling |ref_error_bp| stats for one asset over the most recent resolved windows that
+    carry official Gamma metadata (P0 strike-truth audit). Returns median/max abs error, a side-
+    mismatch count (our winning_side vs official_winning_side), and the sample size. Feeds the
+    dashboard's strike-accuracy panel and answers 'is our strike reliably inside the move gate?'."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT ref_error_bp, winning_side, official_winning_side FROM outcomes "
+            "WHERE asset = ? AND ref_error_bp IS NOT NULL "
+            "ORDER BY start_ts DESC LIMIT ?", (asset, limit)
+        ).fetchall()
+    errs = sorted(abs(r["ref_error_bp"]) for r in rows if r["ref_error_bp"] is not None)
+    mismatches = sum(1 for r in rows
+                     if r["official_winning_side"] and r["winning_side"]
+                     and r["official_winning_side"] != r["winning_side"])
+    median = errs[len(errs) // 2] if errs else None
+    return {
+        "n": len(errs),
+        "median_abs_bp": round(median, 2) if median is not None else None,
+        "max_abs_bp": round(errs[-1], 2) if errs else None,
+        "side_mismatches": mismatches,
+    }
 
 
 def get_outcome(start_ts: int, asset: str = "BTC") -> Optional[dict]:

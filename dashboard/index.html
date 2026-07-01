@@ -219,6 +219,7 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
           <div class="sp"><div class="k">Binance</div><div id="px-binance" class="v">—</div></div>
         </div>
         <div class="k" style="margin-top:6px;color:var(--ink-4);font-size:9px">*Chainlink = the feed Polymarket settles on (Price to Beat). Strike source: RTDS Data-Streams → on-chain Chainlink (Polygon) → CEX proxy. Proxy = ~4-5bp basis risk (shown on the strike chip).</div>
+        <div id="strike-audit" class="k" style="margin-top:4px;font-size:9px;color:var(--ink-4)">strike audit —</div>
       </div>
       <div class="pane">
         <div class="cap">Settlement Model <span class="chip" id="strike-chip">strike —</span></div>
@@ -422,7 +423,8 @@ function render(d){
   // All per-asset blocks come from the selected asset's worker snapshot.
   const a=(d.assets||{})[sel]||{};
   const bot=d.bot||{},mk=a.market||{},btc=a.px||{},bk=a.book||{},sg=a.signal||{},
-        st=a.strategy||{},pos=a.position,day=a.day||{},tr=d.ledger||d.recent_trades||[];
+        st=a.strategy||{},pos=a.position,day=a.day||{},tr=d.ledger||d.recent_trades||[],
+        strk=a.strike||{};
   set('px-cap','Live '+(a.name||sel)+' Price','');
 
   // header
@@ -454,6 +456,21 @@ function render(d){
   if(stk==='CAPTURED'&&ssrc) stkc = ssrc==='rtds' ? ['strike ✓ chainlink','chip ok']
         : ssrc==='onchain' ? ['strike ✓ on-chain','chip ok'] : ['strike ⚠ CEX proxy','chip wait'];
   set('strike-chip',stkc[0],stkc[1]);
+  // P0 strike-truth audit line: RTDS staleness + how far our strike has historically missed the
+  // official Price-to-Beat (median/max abs bp) + side mismatches + source mix.
+  (function(){
+    const re=strk.ref_error||{}, sc=strk.source_counts||{};
+    const age=strk.rtds_last_tick_age;
+    const rtds = strk.rtds_connected ? ('RTDS '+(age!=null?age.toFixed(0)+'s':'live')
+                 + (age!=null&&age>8?' ⚠stale':'')) : 'RTDS ✗';
+    const err = re.n ? ('err med '+f(re.median_abs_bp||0,1)+'/max '+f(re.max_abs_bp||0,1)+'bp'
+                 + (re.side_mismatches?(' · '+re.side_mismatches+' side-miss'):'')+' (n'+re.n+')')
+                 : 'err —';
+    const mix = 'src '+(sc.rtds||0)+'/'+(sc.onchain||0)+'/'+(sc.proxy||0);
+    const el=$('strike-audit');
+    if(el){ el.textContent = rtds+' · '+err+' · '+mix+' (rtds/onchain/proxy)';
+            el.style.color = strk.warn ? 'var(--warn)' : 'var(--ink-4)'; }
+  })();
   set('m-ref',mk.reference_price?'$'+commas(mk.reference_price):'—','v num '+(mk.reference_price?'':'muted'));
   const dist=btc.distance_bp;
   set('m-dist',dist!=null?(dist>=0?'+':'')+f(dist,1)+' bp':'—','v num '+(dist==null?'muted':dist>=0?'up':'down'));

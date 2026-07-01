@@ -127,10 +127,25 @@ class MarketDiscovery:
             return None
         return self._parse_event(ev, start_ts)
 
-    def fetch_resolution(self, start_ts: int) -> Optional[str]:
+    def fetch_resolution(self, start_ts: int) -> Optional[dict]:
         """
-        Return the winning side ('UP'/'DOWN') for a window once resolved, else None.
-        Reads the real Polymarket resolution (outcomePrices), NOT a price proxy.
+        Return the resolved outcome for a window as a dict, or None if not yet resolved:
+
+            {
+              "winning_side": "UP" | "DOWN",        # authoritative winner (best available)
+              "price_to_beat": float | None,        # official Gamma eventMetadata.priceToBeat
+              "final_price": float | None,          # official Gamma eventMetadata.finalPrice
+              "official_winning_side": "UP" | "DOWN" | None,  # derived from official prices
+              "source": "GAMMA_EVENT_METADATA" | "OUTCOME_PRICES",
+            }
+
+        P0 (IMPROVEMENT.md): resolved Gamma events expose the OFFICIAL settlement numbers
+        (priceToBeat / finalPrice) in `eventMetadata`. We surface them so callers can audit
+        exactly how wrong our snapshotted strike was (ref_error_bp) and correct positions /
+        calibration against Polymarket's true settlement. If eventMetadata is missing we fall
+        back to the resolved `outcomePrices` and leave the official numeric fields null.
+
+        Backward-compat: callers that only need the winner read result["winning_side"].
         """
         ev = self._fetch_event(window_slug(start_ts, self.asset))
         if not ev:
@@ -138,18 +153,63 @@ class MarketDiscovery:
         mkt = self._first_market(ev)
         if not mkt:
             return None
+
+        # Winner from resolved outcomePrices (the existing, always-available signal).
+        winner_from_prices = self._winner_from_prices(mkt)
+
+        # Official settlement metadata (present only after resolution).
+        meta = self._event_metadata(ev)
+        price_to_beat = _to_float(meta.get("priceToBeat"))
+        final_price = _to_float(meta.get("finalPrice"))
+        official_side = None
+        if price_to_beat is not None and final_price is not None:
+            official_side = "UP" if final_price >= price_to_beat else "DOWN"
+
+        winning_side = official_side or winner_from_prices
+        if winning_side is None:
+            return None   # not resolved yet (no official metadata AND no ~1.0 outcome price)
+
+        return {
+            "winning_side": winning_side,
+            "price_to_beat": price_to_beat,
+            "final_price": final_price,
+            "official_winning_side": official_side,
+            "source": "GAMMA_EVENT_METADATA" if official_side else "OUTCOME_PRICES",
+        }
+
+    @staticmethod
+    def _winner_from_prices(mkt: dict) -> Optional[str]:
         prices = _json_list(mkt.get("outcomePrices"))
         outcomes = _json_list(mkt.get("outcomes"))
         if not prices or not outcomes or len(prices) != len(outcomes):
             return None
-        # Resolved when one outcome price is ~1.0
-        for outcome, px in zip(outcomes, prices):
+        for outcome, px in zip(outcomes, prices):   # resolved when one price is ~1.0
             try:
                 if float(px) >= 0.99:
                     return "UP" if str(outcome).lower() in ("up", "yes", "higher") else "DOWN"
             except (TypeError, ValueError):
                 continue
         return None
+
+    @staticmethod
+    def _event_metadata(ev: dict) -> dict:
+        """Extract Gamma `eventMetadata` (may be a dict or a JSON string; also try the first
+        market's copy). Returns {} when absent (i.e. before resolution)."""
+        for holder in (ev, *(ev.get("markets") or [])):
+            if not isinstance(holder, dict):
+                continue
+            raw = holder.get("eventMetadata")
+            if raw in (None, ""):
+                continue
+            if isinstance(raw, dict):
+                return raw
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return {}
 
     # ─── HTTP ────────────────────────────────────────────────────────────────────
 
@@ -289,6 +349,16 @@ def _rewards_live(clob_rewards) -> bool:
             except (TypeError, ValueError):
                 continue
     return False
+
+
+def _to_float(value) -> Optional[float]:
+    """Parse a numeric Gamma field to float, or None if missing/unparseable."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _json_list(value) -> list:

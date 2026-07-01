@@ -262,7 +262,7 @@ class SignalEngine:
 
     # ─── Certainty / feed-lag gate (APPROACH.md §3① · paper shadow) ─────────────
 
-    def certainty_shadow(self, s: Signal) -> Optional[tuple]:
+    def certainty_shadow(self, s: Signal, strike_source: Optional[str] = None) -> Optional[tuple]:
         """
         APPROACH.md §3① certainty/feed-lag pick, as an ISOLATED read of the already-computed
         signal. Deliberately NOT routed through evaluate()/Action dispatch, so it can neither
@@ -280,8 +280,14 @@ class SignalEngine:
         t = s.time_remaining
         if not (config.CERTAINTY_ZONE_END <= t <= config.CERTAINTY_ZONE_START):
             return None
-        # Window-Delta gate (winners' dominant signal): the oracle must already have moved.
-        if abs(s.distance_bp) < config.CERTAINTY_MIN_MOVE_BP:
+        # Window-Delta gate (winners' dominant signal): the oracle must already have moved. The
+        # threshold scales with STRIKE-SOURCE uncertainty (P0): a proxy/on-chain strike can be
+        # wrong by more bp than an rtds strike, so demand a bigger observed move before trusting it.
+        min_move = config.CERTAINTY_MIN_MOVE_BP
+        if strike_source:
+            min_move = max(min_move,
+                           config.CERTAINTY_MIN_MOVE_BP_BY_SOURCE.get(strike_source, min_move))
+        if abs(s.distance_bp) < min_move:
             return None
         floor = config.CERTAINTY_FLOOR
         # p_up + p_down = 1 ⇒ at most one side clears a floor ≥ 0.5 (no coin-flip trades).
@@ -293,7 +299,11 @@ class SignalEngine:
             return None
         if bid is not None and (ask - bid) > config.MAX_SPREAD:
             return None
-        if ask > config.CERTAINTY_MAX_ASK:                 # too rich — fee eats the edge
+        # Max-ask gate with the LATE high-ask exception: normally never buy above CERTAINTY_MAX_ASK
+        # (0.94) because the fee eats the edge and rich asks bought too early can still flip; but
+        # allow a .94-.97 ask when the trade is extremely late AND near-locked (the winners' genuine
+        # late-favorite fills). See allow_certainty_entry / IMPROVEMENT.md §4.
+        if not allow_certainty_entry(t, p_side, ask):      # too rich for this lateness/certainty
             return None
         if ask < config.CERTAINTY_MIN_ASK:                 # book disagrees too much — model error, not lag
             return None
@@ -302,7 +312,14 @@ class SignalEngine:
         if config.CERTAINTY_BARBELL_ENABLED and \
            config.CERTAINTY_DEAD_ASK_LO <= ask < config.CERTAINTY_DEAD_ASK_HI:
             return None
-        if (p_side - ask) < config.CERTAINTY_LAG_MARGIN:   # book hasn't lagged enough
+        # Lag requirement: normally CERTAINTY_LAG_MARGIN (0.08). A high-ask exception entry (ask
+        # above CERTAINTY_MAX_ASK — a near-locked favorite in the final seconds) is inherently
+        # thin-edge, so it uses the smaller CERTAINTY_HIGH_ASK_MIN_EDGE it already had to clear in
+        # allow_certainty_entry; otherwise the 0.08 margin would make the exception unreachable.
+        lag_req = config.CERTAINTY_LAG_MARGIN
+        if ask > config.CERTAINTY_MAX_ASK:
+            lag_req = min(lag_req, config.CERTAINTY_HIGH_ASK_MIN_EDGE)
+        if (p_side - ask) < lag_req:                       # book hasn't lagged enough
             return None
         if pricing.taker_ev_per_share(p_side, ask) < 0:    # not fee-net positive
             return None
@@ -350,6 +367,19 @@ class SignalEngine:
         if t_remaining > config.TAKER_ZONE_END:
             return 2
         return 3
+
+
+def allow_certainty_entry(t_remaining: float, p_side: float, ask: float) -> bool:
+    """Max-ask gate for the certainty leg (IMPROVEMENT.md §4). Normally the ask must be at/below
+    CERTAINTY_MAX_ASK (0.94). A richer ask (up to CERTAINTY_HIGH_ASK_MAX) is allowed ONLY when the
+    trade is extremely late and near-locked — the winners' genuine .95-.99 late-favorite fills —
+    never at T-90s where a near-certain favorite can still flip."""
+    if ask <= config.CERTAINTY_MAX_ASK:
+        return True
+    return (ask <= config.CERTAINTY_HIGH_ASK_MAX
+            and t_remaining <= config.CERTAINTY_HIGH_ASK_MAX_T
+            and p_side >= config.CERTAINTY_HIGH_ASK_MIN_P
+            and (p_side - ask) >= config.CERTAINTY_HIGH_ASK_MIN_EDGE)
 
 
 def _tick(tick_size: str) -> float:

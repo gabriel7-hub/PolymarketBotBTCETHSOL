@@ -114,6 +114,9 @@ class AssetWorker:
         self._current_window_id: str = ""
         self._refs: dict[int, float] = {}        # start_ts -> snapshotted strike
         self._ref_source: dict[int, str] = {}    # start_ts -> strike source (rtds|onchain|proxy)
+        # Running count of how many windows we struck from each source (P0 dashboard telemetry:
+        # a rising 'proxy'/'onchain' share means our strike is drifting off the true Price-to-Beat).
+        self._strike_source_counts: dict[str, int] = {"rtds": 0, "onchain": 0, "proxy": 0}
         self._missed: set[int] = set()           # windows we caught too late to strike
         self._ref_lock = threading.Lock()        # guards _refs/_missed (strike thread + loop)
         self._pending: dict[int, str] = {}       # start_ts -> condition_id awaiting resolution
@@ -383,16 +386,23 @@ class AssetWorker:
                         and self.asset in config.CERTAINTY_ASSETS
                         and start_ts not in self._cert_shadow
                         and start_ts not in self._maker_pending):
-                    pick = self.engine.certainty_shadow(signal)
-                    if (pick is not None and not self.paper_mode
-                            and self.asset in config.CERTAINTY_LIVE_ASSETS):
+                    strike_src = self._ref_source.get(start_ts)
+                    pick = self.engine.certainty_shadow(signal, strike_src)
+                    # LIVE-capital gate (P0, IMPROVEMENT.md): real orders require the master switch
+                    # CERTAINTY_LIVE_ENABLED, live mode, the asset whitelist, AND — until the strike
+                    # audit is clean — an EXACT rtds strike (CERTAINTY_REQUIRE_RTDS_LIVE). Anything
+                    # else falls through to the paper shadow branch below.
+                    live_ok = (config.CERTAINTY_LIVE_ENABLED and not self.paper_mode
+                               and self.asset in config.CERTAINTY_LIVE_ASSETS
+                               and (not config.CERTAINTY_REQUIRE_RTDS_LIVE
+                                    or strike_src == "rtds"))
+                    if pick is not None and live_ok:
                         # ── LIVE certainty order ──────────────────────────────────────────
-                        # Real USDC — ONLY for assets on the CERTAINTY_LIVE_ASSETS whitelist (SOL).
-                        # Any other asset that fires the leg in live mode falls to the paper branch
-                        # below. Gated further by (1) the dashboard kill switch and (2) the per-asset
-                        # risk guard (open-position + global daily-loss halt). Opens a real position
-                        # resolved by _resolve_position; a sentinel in _cert_shadow stops the gate
-                        # from re-firing this window.
+                        # Real USDC — ONLY for whitelisted assets with an rtds strike. Any other
+                        # asset/source that fires the leg falls to the paper branch below. Gated
+                        # further by (1) the dashboard kill switch and (2) the per-asset risk guard
+                        # (open-position + global daily-loss halt). Opens a real position resolved by
+                        # _resolve_position; a sentinel in _cert_shadow stops the gate from re-firing.
                         cside, cask, csize = pick
                         # Cross-asset correlation guard (combined STAKE cap): the 4 assets move
                         # together, so reserve this asset's fair share (budget / #live-assets) of a
@@ -556,6 +566,7 @@ class AssetWorker:
                 src = self.oracle.strike_source            # rtds | onchain | proxy
                 self._refs[start_ts] = px
                 self._ref_source[start_ts] = src
+                self._strike_source_counts[src] = self._strike_source_counts.get(src, 0) + 1
                 if src == "proxy":
                     # The strike is a CEX proxy (~4-5bp basis vs the real Chainlink Price to
                     # Beat) because BOTH Chainlink sources were stale at T=0. Visible warning:
@@ -592,10 +603,11 @@ class AssetWorker:
             # state push → dashboard flips to BOT DISCONNECTED). Over budget we skip the fetch
             # this cycle; valid-strike windows still settle via the fallback path below.
             if fetched < config.RESOLUTION_MAX_FETCH_PER_CYCLE:
-                winning = self.discovery.fetch_resolution(start_ts)
+                res = self.discovery.fetch_resolution(start_ts)
                 fetched += 1
             else:
-                winning = None
+                res = None
+            winning = res["winning_side"] if res else None
             ref = self._get_ref(start_ts)
             settle = self._settles.get(start_ts) or self.oracle.price
             predicted = "UP" if (ref and settle >= ref) else "DOWN"
@@ -639,6 +651,7 @@ class AssetWorker:
                 "ref_price": ref, "settle_price": settle,
                 "winning_side": winning, "predicted_side": predicted,
                 "resolved_at": time.time(), "resolution_source": source,
+                **self._official_audit(res, ref, settle),
             })
             self._resolve_position(condition_id, winning)
             self._resolve_late_mom(start_ts, winning)
@@ -664,17 +677,20 @@ class AssetWorker:
                 if fetched >= config.RESOLUTION_MAX_FETCH_PER_CYCLE:
                     break   # bound loop stall on slow/flaky VPS network
                 fetched += 1
-                winning = self.discovery.fetch_resolution(start_ts)
+                res = self.discovery.fetch_resolution(start_ts)
+                winning = res["winning_side"] if res else None
                 if winning is None:
                     continue
                 o = state.get_outcome(start_ts, self.asset) or {}
+                ref = o.get("ref_price") or self._get_ref(start_ts)
+                settle = o.get("settle_price")
                 state.upsert_outcome({
                     "asset": self.asset,
                     "start_ts": start_ts, "market_id": condition_id,
-                    "ref_price": o.get("ref_price") or self._get_ref(start_ts),
-                    "settle_price": o.get("settle_price"),
+                    "ref_price": ref, "settle_price": settle,
                     "winning_side": winning, "predicted_side": o.get("predicted_side"),
                     "resolved_at": time.time(), "resolution_source": "REAL",
+                    **self._official_audit(res, ref, settle),
                 })
                 self._awaiting_real.pop(start_ts, None)
                 # Correct the position if our fast proxy settle disagreed with the REAL
@@ -682,6 +698,31 @@ class AssetWorker:
                 self._resettle_to_real(condition_id, winning)
                 logger.debug(f"[{self.asset}] Window {start_ts} REAL outcome captured: "
                              f"{winning} (calibration)")
+
+    @staticmethod
+    def _official_audit(res: Optional[dict], ref: float, settle: Optional[float]) -> dict:
+        """Build the official-settlement audit fields for upsert_outcome from a fetch_resolution
+        dict (P0, IMPROVEMENT.md): the true Gamma priceToBeat/finalPrice and how many bp OUR
+        snapshotted strike (ref) and close snapshot (settle) missed them. Returns all-None keys
+        when official metadata is absent (older resolution or outcomePrices-only fallback), so the
+        COALESCE upsert leaves any previously-stored audit untouched."""
+        out = {
+            "official_price_to_beat": None, "official_final_price": None,
+            "official_winning_side": None, "ref_error_bp": None, "final_error_bp": None,
+        }
+        if not res:
+            return out
+        ptb = res.get("price_to_beat")
+        fin = res.get("final_price")
+        out["official_price_to_beat"] = ptb
+        out["official_final_price"] = fin
+        out["official_winning_side"] = res.get("official_winning_side")
+        if ptb:
+            if ref:
+                out["ref_error_bp"] = round((ref - ptb) / ptb * 1e4, 3)
+            if settle:
+                out["final_error_bp"] = round((settle - fin) / fin * 1e4, 3) if fin else None
+        return out
 
     def _resettle_to_real(self, condition_id: str, winning: str):
         import pricing
@@ -1133,6 +1174,21 @@ class AssetWorker:
                 "distance_bp": round(signal.distance_bp, 2) if signal else None,
                 "connected": self.oracle.connected,
             },
+            # P0 strike-truth telemetry (IMPROVEMENT.md): is the strike coming from the exact
+            # Chainlink feed, and how far has it historically missed the official Price-to-Beat?
+            "strike": {
+                "current_source": self.oracle.strike_source,
+                "window_source": (self._ref_source.get(int(window.start_ts))
+                                  if window else None),
+                "rtds_connected": self.oracle.rtds_connected,
+                "rtds_last_tick_age": (round(self.oracle.rtds_last_tick_age, 1)
+                                       if self.oracle.rtds_last_tick_age is not None else None),
+                "onchain_fresh": self.oracle.onchain_fresh,
+                "source_counts": dict(self._strike_source_counts),
+                "ref_error": state.get_ref_error_stats(self.asset),
+                # A visible warning flag when the live strike is NOT the exact rtds feed.
+                "warn": self.oracle.strike_source != "rtds",
+            },
             "book": {
                 "up_bid": self.book.up_bid, "up_ask": self.book.up_ask,
                 "down_bid": self.book.down_bid, "down_ask": self.book.down_ask,
@@ -1163,6 +1219,8 @@ class AssetWorker:
                 "late_mom_open": len(self._late_mom),
                 "late_mom_session": round(self._late_mom_session, 2),
                 "cert_shadow_enabled": config.CERTAINTY_SHADOW_ENABLED,
+                "cert_live_enabled": config.CERTAINTY_LIVE_ENABLED,
+                "cert_zone": [config.CERTAINTY_ZONE_START, config.CERTAINTY_ZONE_END],
                 "cert_shadow_open": len(self._cert_shadow),
                 "cert_shadow_session": round(self._cert_shadow_session, 2),
                 "maker_pending": len(self._maker_pending),
